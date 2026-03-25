@@ -181,9 +181,41 @@ pip install openenv-core[core] openai
 # Run the server locally
 uvicorn server.app:app --host 0.0.0.0 --port 8000 --reload
 
-# In another terminal, run the baseline
+# In another terminal, run the baseline (see "Supported LLM Providers" below)
 OPENAI_API_KEY=sk-... python baseline_inference.py --verbose
 ```
+
+### Supported LLM Providers
+
+The baseline inference script works with **any OpenAI-compatible API**. Set the appropriate environment variable or use `--api-key` / `--api-base` flags:
+
+```bash
+# OpenAI (default)
+OPENAI_API_KEY=sk-... python baseline_inference.py --model gpt-4o-mini
+
+# OpenRouter — access 200+ models (Gemini, Claude, Llama, Mistral, etc.)
+OPENROUTER_API_KEY=sk-or-... python baseline_inference.py --model google/gemini-2.5-flash
+
+# Anthropic (OpenAI-compatible endpoint)
+ANTHROPIC_API_KEY=sk-ant-... python baseline_inference.py --model claude-sonnet-4-20250514
+
+# Local models via Ollama
+python baseline_inference.py --api-base http://localhost:11434/v1 --api-key dummy --model llama3
+
+# Any OpenAI-compatible provider
+python baseline_inference.py --api-key YOUR_KEY --api-base https://your-provider/v1 --model your-model
+
+# Universal override (works with any provider)
+LLM_API_KEY=... LLM_API_BASE=https://provider/v1 python baseline_inference.py --model model-name
+```
+
+**Environment variables** (auto-detected in order):
+| Variable | Provider | API Base |
+|----------|----------|----------|
+| `LLM_API_KEY` + `LLM_API_BASE` | Any | Custom |
+| `OPENROUTER_API_KEY` | OpenRouter | `https://openrouter.ai/api/v1` |
+| `ANTHROPIC_API_KEY` | Anthropic | `https://api.anthropic.com/v1` |
+| `OPENAI_API_KEY` | OpenAI | `https://api.openai.com/v1` |
 
 ### Docker
 
