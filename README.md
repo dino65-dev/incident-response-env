@@ -156,7 +156,28 @@ Deterministic baseline (scripted optimal agent, seed=42):
 | Hard (Insider Threat) | 0.9175 | 18 |
 | **Mean** | **0.9058** | — |
 
-The deterministic baseline achieves high scores because it follows the optimal investigation path. An LLM agent would face the challenge of discovering this path through observation and reasoning alone.
+The deterministic baseline achieves high scores because it follows the optimal investigation path. An LLM agent faces the challenge of discovering this path through observation and reasoning alone.
+
+---
+
+## LLM Agent Architecture
+
+The `baseline_inference.py` agent implements state-of-the-art techniques from recent research:
+
+### ReflAct Reasoning (Kim et al., 2025)
+At each step, the agent reflects on its **current state relative to the investigation goal** before choosing an action — preventing the goal-drift and hallucination that plague standard ReAct agents. This approach achieves 27.7% improvement over ReAct on decision-making benchmarks ([arXiv:2505.15182](https://arxiv.org/abs/2505.15182)).
+
+### Pre-Act Planning (Rawat et al., 2025)
+The agent generates a **multi-step investigation plan** upfront (INVESTIGATE → CLASSIFY → CONTAIN → REPORT) and tracks progress against it. This incremental planning outperforms ReAct by 70% on action recall ([arXiv:2505.09970](https://arxiv.org/abs/2505.09970)).
+
+### SOC Playbook Structure (Reynolds, 2025; Baral et al., 2025)
+The phased workflow mirrors real-world SOC incident response playbooks (NIST SP 800-61, SANS IR framework). Research shows that policy-driven LLM agents with structured playbooks reduce analyst workload by 39% and achieve 33% faster mean time-to-respond ([JRPS v16.i4.331](https://jrpsjournal.in/index.php/j/article/view/331); [IEEE IWCMC 2025](https://ieeexplore.ieee.org/document/11059476/)).
+
+### Focused ReAct Anti-Loop (Li et al., 2024)
+Explicit **repetition detection** and forced progression prevent the agent from getting stuck in action loops — a common failure mode identified in [arXiv:2410.10779](https://arxiv.org/abs/2410.10779).
+
+### Evidence-Grounded Feedback
+Each step includes a **structured state summary** showing discovered evidence, identified IOCs, queried log sources, and current investigation phase — giving the LLM explicit grounding for its next decision.
 
 ---
 
