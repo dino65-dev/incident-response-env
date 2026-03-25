@@ -87,8 +87,54 @@ Respond with a JSON object containing your chosen action parameters. Be thorough
 """
 
 
+# Valid fields for the IncidentAction Pydantic model.
+# Any extra keys the LLM invents will cause a 422 from the server
+# because the model uses extra="forbid".
+VALID_ACTION_FIELDS = {
+    "action_type", "log_source", "query_filter", "endpoint_id",
+    "user_id", "severity", "threat_category", "containment_actions",
+    "target", "report_summary", "escalate_to", "metadata",
+}
+
+VALID_ACTION_TYPES = {
+    "examine_alert", "query_logs", "check_threat_intel",
+    "correlate_events", "inspect_endpoint", "check_user_history",
+    "classify_severity", "contain_threat", "escalate",
+    "close_as_false_positive", "submit_report",
+}
+
+
+def sanitize_action(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sanitize an action dict so it passes Pydantic validation.
+
+    - Strips unknown keys (LLMs love to add extra fields)
+    - Normalises action_type to a valid enum value
+    - Removes keys with None values (avoids Pydantic issues)
+    """
+    # Keep only known fields
+    clean = {k: v for k, v in raw.items() if k in VALID_ACTION_FIELDS and v is not None}
+
+    # Ensure action_type exists and is valid
+    at = clean.get("action_type", "examine_alert")
+    if isinstance(at, str):
+        at = at.strip().lower().replace(" ", "_").replace("-", "_")
+    if at not in VALID_ACTION_TYPES:
+        # Try fuzzy match
+        for valid in VALID_ACTION_TYPES:
+            if at in valid or valid in at:
+                at = valid
+                break
+        else:
+            at = "examine_alert"
+    clean["action_type"] = at
+
+    return clean
+
+
 def make_action_from_llm_response(response_text: str) -> Dict[str, Any]:
-    """Parse LLM response into an action dict."""
+    """Parse LLM response into a sanitized action dict."""
+    raw = {}
     try:
         # Try to extract JSON from the response
         text = response_text.strip()
@@ -97,19 +143,25 @@ def make_action_from_llm_response(response_text: str) -> Dict[str, Any]:
         elif "```" in text:
             text = text.split("```")[1].split("```")[0].strip()
 
-        action = json.loads(text)
-        return action
+        raw = json.loads(text)
     except (json.JSONDecodeError, IndexError):
         # Fallback: try to find JSON object in text
         import re
-        json_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', response_text)
+        # Match nested JSON (up to 2 levels deep)
+        json_match = re.search(
+            r'\{[^{}]*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}[^{}]*)*\}',
+            response_text,
+        )
         if json_match:
             try:
-                return json.loads(json_match.group())
+                raw = json.loads(json_match.group())
             except json.JSONDecodeError:
                 pass
-        # Ultimate fallback
-        return {"action_type": "examine_alert"}
+
+    if not raw or not isinstance(raw, dict):
+        raw = {"action_type": "examine_alert"}
+
+    return sanitize_action(raw)
 
 
 def run_llm_agent(
@@ -133,12 +185,15 @@ def run_llm_agent(
     Returns:
         Dict with score and action history
     """
-    # Reset environment
+    # Reset environment (use /env/reset for stateful interaction)
     reset_response = requests.post(
-        f"{base_url}/reset",
+        f"{base_url}/env/reset",
         json={"seed": 42, "task_id": task_id},
         timeout=30,
     )
+    if reset_response.status_code != 200:
+        print(f"  RESET FAILED ({reset_response.status_code}): {reset_response.text[:200]}")
+        return {"task_id": task_id, "score": 0.0, "steps_taken": 0, "actions": [], "breakdown": {}}
     reset_data = reset_response.json()
 
     observation = reset_data.get("observation", {})
@@ -189,13 +244,25 @@ def run_llm_agent(
         if verbose:
             print(f"  Step {step_num + 1}: {action.get('action_type', 'unknown')}")
 
-        # Execute step
+        # Execute step (use /env/step for stateful interaction)
         try:
             step_response = requests.post(
-                f"{base_url}/step",
+                f"{base_url}/env/step",
                 json={"action": action},
                 timeout=30,
             )
+            if step_response.status_code == 422:
+                # Validation error — show details and retry with fallback
+                err_detail = step_response.json().get("detail", step_response.text[:200])
+                if verbose:
+                    print(f"    422 Validation Error: {err_detail}")
+                # Retry with a safe fallback action
+                fallback = {"action_type": "examine_alert"}
+                step_response = requests.post(
+                    f"{base_url}/env/step",
+                    json={"action": fallback},
+                    timeout=30,
+                )
             step_data = step_response.json()
         except Exception as e:
             print(f"  Step API error: {e}")

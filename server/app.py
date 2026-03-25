@@ -8,28 +8,37 @@ FastAPI application for the Incident Response Triage Environment.
 This module creates an HTTP server that exposes the IncidentResponseEnvEnvironment
 over HTTP and WebSocket endpoints, compatible with EnvClient.
 
-Endpoints:
-    - POST /reset: Reset the environment
-    - POST /step: Execute an action
-    - GET /state: Get current environment state
-    - GET /schema: Get action/observation schemas
-    - GET /tasks: Get list of available tasks
-    - GET /grader: Get grader score for current episode
-    - POST /baseline: Run baseline inference on all tasks
-    - WS /ws: WebSocket endpoint for persistent sessions
+IMPORTANT: OpenEnv's create_app() generates stateless REST endpoints (each call
+creates a new environment instance). For our stateful incident investigation,
+we add custom stateful endpoints (/env/reset, /env/step, /env/state) that share
+a single environment instance across calls. The baseline inference script uses
+these stateful endpoints.
 
-Usage:
-    # Development (with auto-reload):
-    uvicorn server.app:app --reload --host 0.0.0.0 --port 8000
+Endpoints (stateful — use these for agent interaction):
+    - POST /env/reset: Reset the environment (preserves state for subsequent steps)
+    - POST /env/step: Execute an action (uses the environment from the last reset)
+    - GET  /env/state: Get current environment state
 
-    # Production:
-    uvicorn server.app:app --host 0.0.0.0 --port 8000 --workers 4
+Endpoints (OpenEnv spec — stateless, for validation):
+    - POST /reset: Reset (stateless, OpenEnv spec)
+    - POST /step: Execute action (stateless, OpenEnv spec)
+    - GET  /state: Get state (stateless, OpenEnv spec)
+    - GET  /schema: Get action/observation JSON schemas
+    - GET  /health: Health check
+    - WS   /ws: WebSocket for persistent sessions
+
+Endpoints (hackathon extras):
+    - GET  /tasks: List all tasks with descriptions and action schema
+    - GET  /grader: Get grader score for current episode
+    - POST /baseline: Run deterministic baseline on all 3 tasks
 """
 
+import traceback
 from typing import Any, Dict, List
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 try:
     from openenv.core.env_server.http_server import create_app
@@ -46,7 +55,7 @@ except ImportError:
     from server.incident_response_env_environment import IncidentResponseEnvEnvironment
 
 
-# Create the OpenEnv app
+# Create the OpenEnv spec-compliant app (stateless REST + WebSocket)
 app = create_app(
     IncidentResponseEnvEnvironment,
     IncidentAction,
@@ -55,12 +64,84 @@ app = create_app(
     max_concurrent_envs=1,
 )
 
-# Store a reference for additional endpoints
-_env_instance = IncidentResponseEnvEnvironment()
+
+# =============================================================================
+# Shared Stateful Environment for HTTP interaction
+# =============================================================================
+
+# This single instance persists state across /env/reset and /env/step calls
+_shared_env = IncidentResponseEnvEnvironment()
+
+
+class ResetBody(BaseModel):
+    seed: int | None = None
+    episode_id: str | None = None
+    task_id: str | None = "easy"
+
+
+class StepBody(BaseModel):
+    action: Dict[str, Any]
+
+
+@app.post("/env/reset")
+async def stateful_reset(body: ResetBody):
+    """
+    Reset the shared environment instance (stateful).
+    State persists for subsequent /env/step calls.
+    """
+    try:
+        obs = _shared_env.reset(
+            seed=body.seed,
+            episode_id=body.episode_id,
+            task_id=body.task_id,
+        )
+        obs_dict = obs.model_dump(exclude={"reward", "done", "metadata"})
+        return JSONResponse(content={
+            "observation": obs_dict,
+            "reward": obs.reward,
+            "done": obs.done,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/env/step")
+async def stateful_step(body: StepBody):
+    """
+    Execute an action on the shared environment (stateful).
+    Uses the environment state from the last /env/reset call.
+    """
+    try:
+        # Validate and create the action
+        action = IncidentAction.model_validate(body.action)
+    except Exception as e:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid action: {e}"
+        )
+
+    try:
+        obs = _shared_env.step(action)
+        obs_dict = obs.model_dump(exclude={"reward", "done", "metadata"})
+        return JSONResponse(content={
+            "observation": obs_dict,
+            "reward": obs.reward if isinstance(obs.reward, (int, float)) else 0.0,
+            "done": obs.done,
+        })
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/env/state")
+async def stateful_state():
+    """Get the current state of the shared environment."""
+    state = _shared_env.state
+    return JSONResponse(content=state.model_dump())
 
 
 # =============================================================================
-# Additional Hackathon-Required Endpoints
+# Hackathon-Required Endpoints
 # =============================================================================
 
 
@@ -68,38 +149,22 @@ _env_instance = IncidentResponseEnvEnvironment()
 async def get_tasks():
     """
     Returns the list of tasks and the action schema.
-
-    Each task includes:
-    - task_id: Unique identifier (easy, medium, hard)
-    - name: Human-readable task name
-    - description: What the task involves
-    - difficulty: Difficulty level
-    - expected_steps: Expected step range
-    - key_skills: Skills tested
-    - action_schema: JSON schema for the Action model
     """
-    return JSONResponse(content=_env_instance.get_tasks())
+    return JSONResponse(content=_shared_env.get_tasks())
 
 
 @app.get("/grader")
 async def get_grader():
     """
     Returns the grader score after an episode is completed.
-
-    Returns a score between 0.0 and 1.0 with a detailed breakdown
-    across investigation completeness, IOC identification, severity
-    classification, containment accuracy, and report quality.
     """
-    return JSONResponse(content=_env_instance.get_grader_score())
+    return JSONResponse(content=_shared_env.get_grader_score())
 
 
 @app.post("/baseline")
 async def run_baseline():
     """
-    Trigger baseline inference script and returns baseline scores for all 3 tasks.
-
-    This endpoint creates a fresh environment instance and runs a deterministic
-    baseline agent (random valid actions) against each task, returning scores.
+    Trigger baseline and return scores for all 3 tasks.
     """
     from .baseline_runner import run_baseline_all_tasks
 
@@ -108,13 +173,7 @@ async def run_baseline():
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):
-    """
-    Entry point for direct execution.
-
-    Args:
-        host: Host address to bind to (default: "0.0.0.0")
-        port: Port number to listen on (default: 8000)
-    """
+    """Entry point for direct execution."""
     import uvicorn
 
     uvicorn.run(app, host=host, port=port)
