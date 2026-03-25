@@ -1,0 +1,30 @@
+# Copyright (c) 2026 - OpenEnv Hackathon Submission
+# Incident Response Triage Environment
+
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "openenv-incident-response-env"
+version = "0.1.0"
+description = "Cybersecurity Incident Response Triage environment for OpenEnv - trains AI agents to investigate, classify, and respond to security incidents like real SOC analysts"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.1",
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[project.scripts]
+server = "incident_response_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["incident_response_env", "incident_response_env.server"]
+package-dir = { "incident_response_env" = ".", "incident_response_env.server" = "server" }
