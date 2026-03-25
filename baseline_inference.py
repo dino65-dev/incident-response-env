@@ -132,8 +132,11 @@ def sanitize_action(raw: Dict[str, Any]) -> Dict[str, Any]:
     return clean
 
 
-def make_action_from_llm_response(response_text: str) -> Dict[str, Any]:
+def make_action_from_llm_response(response_text: Optional[str]) -> Dict[str, Any]:
     """Parse LLM response into a sanitized action dict."""
+    if not response_text:
+        return sanitize_action({"action_type": "examine_alert"})
+
     raw = {}
     try:
         # Try to extract JSON from the response
@@ -219,20 +222,45 @@ def run_llm_agent(
         if done:
             break
 
-        # Get LLM response
-        try:
-            create_kwargs: Dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0.1,
-                "max_tokens": 1024,
-            }
-            if extra_headers:
-                create_kwargs["extra_headers"] = extra_headers
-            llm_response = client.chat.completions.create(**create_kwargs)
-            assistant_msg = llm_response.choices[0].message.content
-        except Exception as e:
-            print(f"  LLM API error: {e}")
+        # Get LLM response with retry for rate limits
+        assistant_msg = None
+        for _attempt in range(3):
+            try:
+                create_kwargs: Dict[str, Any] = {
+                    "model": model,
+                    "messages": messages,
+                    "temperature": 0.1,
+                    "max_tokens": 1024,
+                }
+                if extra_headers:
+                    create_kwargs["extra_headers"] = extra_headers
+                llm_response = client.chat.completions.create(**create_kwargs)
+                # Guard against empty choices or None content
+                if not llm_response.choices:
+                    if verbose:
+                        print(f"  Step {step_num + 1}: LLM returned empty choices, using fallback")
+                    assistant_msg = '{"action_type": "examine_alert"}'
+                else:
+                    assistant_msg = llm_response.choices[0].message.content
+                    if assistant_msg is None:
+                        # Some models return None content (reasoning models, refusals, etc.)
+                        if verbose:
+                            print(f"  Step {step_num + 1}: LLM returned None content, using fallback")
+                        assistant_msg = '{"action_type": "examine_alert"}'
+                break  # Success, exit retry loop
+            except Exception as e:
+                err_str = str(e)
+                if "429" in err_str or "rate limit" in err_str.lower():
+                    wait_secs = 5 * (_attempt + 1)
+                    if verbose:
+                        print(f"  Rate limited, waiting {wait_secs}s (attempt {_attempt + 1}/3)...")
+                    time.sleep(wait_secs)
+                    continue
+                print(f"  LLM API error: {e}")
+                assistant_msg = '{"action_type": "examine_alert"}'
+                break
+        if assistant_msg is None:
+            print(f"  LLM rate limit exhausted after 3 retries, using fallback")
             assistant_msg = '{"action_type": "examine_alert"}'
 
         messages.append({"role": "assistant", "content": assistant_msg})
