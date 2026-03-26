@@ -1069,7 +1069,7 @@ class IncidentResponseEnvEnvironment(Environment):
 
     def _calculate_investigation_completeness(self) -> float:
         """Calculate what fraction of critical evidence was discovered."""
-        if not self._scenario.critical_evidence:
+        if not self._scenario or not self._scenario.critical_evidence:
             return 1.0
 
         discovered = self._evidence_discovered & self._scenario.critical_evidence
