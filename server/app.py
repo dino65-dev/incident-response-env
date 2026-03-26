@@ -30,9 +30,11 @@ Endpoints (OpenEnv spec — stateless, for validation):
 Endpoints (hackathon extras):
     - GET  /tasks: List all tasks with descriptions and action schema
     - GET  /grader: Get grader score for current episode
-    - POST /baseline: Run deterministic baseline on all 3 tasks
+    - POST /baseline: Run deterministic baseline on all 6 tasks
 """
 
+import os
+import sys
 import traceback
 from typing import Any, Dict, List
 
@@ -51,8 +53,15 @@ try:
     from ..models import IncidentAction, IncidentObservation
     from .incident_response_env_environment import IncidentResponseEnvEnvironment
 except ImportError:
+    # When running from server/ directory, add parent to path
+    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _parent not in sys.path:
+        sys.path.insert(0, _parent)
     from models import IncidentAction, IncidentObservation
-    from server.incident_response_env_environment import IncidentResponseEnvEnvironment
+    try:
+        from server.incident_response_env_environment import IncidentResponseEnvEnvironment
+    except ImportError:
+        from incident_response_env_environment import IncidentResponseEnvEnvironment
 
 
 # Create the OpenEnv spec-compliant app (stateless REST + WebSocket)

@@ -10,20 +10,29 @@ alerts, gather forensic evidence, correlate findings, classify threats,
 and execute incident response actions.
 
 Features:
-- 3 tasks with progressive difficulty (easy → medium → hard)
+- 6 tasks with progressive difficulty (easy -> medium -> hard -> medium_hard -> hard_plus -> expert)
 - Rich, multi-dimensional reward shaping over the full trajectory
 - Realistic forensic artifacts and investigation mechanics
 - Programmatic graders with deterministic scoring
+- Advanced reward signals including evidence chain coherence, phase discipline,
+  containment precision, and investigation breadth
 
 Evaluation criteria:
-- Investigation thoroughness (evidence discovery)
-- IOC identification
-- Correct severity classification
-- Appropriate containment actions
-- Report quality
-- Efficiency (steps used)
+- Investigation thoroughness (evidence discovery): 20%
+- IOC identification: 10%
+- Correct severity classification: 10%
+- Correct threat categorization: 8%
+- Containment completeness: 15%
+- Containment precision: 7%
+- Report quality: 8%
+- Efficiency: 5%
+- Escalation accuracy: 5%
+- Evidence chain coherence: 7%
+- Phase discipline: 5%
 """
 
+import os
+import sys
 import random
 from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
@@ -41,8 +50,13 @@ try:
         Severity,
         ThreatCategory,
     )
-    from ..scenarios import SCENARIOS, Scenario, TASK_DEFINITIONS
+    from ..tasks import SCENARIOS, TASK_DEFINITIONS
+    from ..tasks.base import Scenario
 except ImportError:
+    # When running from server/ directory, add parent to path
+    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _parent not in sys.path:
+        sys.path.insert(0, _parent)
     from models import (
         ActionType,
         ContainmentAction,
@@ -52,7 +66,8 @@ except ImportError:
         Severity,
         ThreatCategory,
     )
-    from scenarios import SCENARIOS, Scenario, TASK_DEFINITIONS
+    from tasks import SCENARIOS, TASK_DEFINITIONS
+    from tasks.base import Scenario
 
 
 class IncidentResponseEnvEnvironment(Environment):
@@ -73,6 +88,8 @@ class IncidentResponseEnvEnvironment(Environment):
     - Efficiency bonus for completing within expected step range
     - Penalties for destructive actions (containing the wrong target),
       infinite investigation loops, or misclassification
+    - Advanced signals: evidence chain coherence, phase discipline,
+      containment precision, investigation breadth
 
     Example:
         >>> env = IncidentResponseEnvEnvironment()
@@ -104,6 +121,11 @@ class IncidentResponseEnvEnvironment(Environment):
         self._reward_this_step: float = 0.0
         self._total_reward: float = 0.0
         self._closed_as_fp: bool = False
+        # Advanced tracking
+        self._log_sources_queried: Set[str] = set()
+        self._ti_iocs_checked: Set[str] = set()
+        self._investigated_before_classify: bool = False
+        self._classified_before_contain: bool = True  # starts true, set false if violated
 
     def reset(self, seed=None, episode_id=None, task_id: str = None, **kwargs) -> IncidentObservation:
         """
@@ -112,7 +134,7 @@ class IncidentResponseEnvEnvironment(Environment):
         Args:
             seed: Optional seed for reproducibility
             episode_id: Optional custom episode ID
-            task_id: Task identifier: "easy", "medium", or "hard"
+            task_id: Task identifier: "easy", "medium", "hard", "medium_hard", "hard_plus", "expert"
 
         Returns:
             Initial IncidentObservation with alert context
@@ -144,6 +166,10 @@ class IncidentResponseEnvEnvironment(Environment):
         self._reward_this_step = 0.0
         self._total_reward = 0.0
         self._closed_as_fp = False
+        self._log_sources_queried = set()
+        self._ti_iocs_checked = set()
+        self._investigated_before_classify = False
+        self._classified_before_contain = True
 
         if seed is not None:
             random.seed(seed)
@@ -200,10 +226,19 @@ class IncidentResponseEnvEnvironment(Environment):
         # Track action
         self._actions_history.append(action.action_type.value)
 
-        # Penalize repeated identical actions (anti-loop)
+        # Penalize repeated identical actions (anti-loop) - stronger penalty at 3+
         recent = self._actions_history[-5:]
         if len(recent) >= 3 and len(set(recent)) == 1:
-            self._reward_this_step -= 0.02
+            self._reward_this_step -= 0.05
+
+        # Phase violation penalty: contain_threat before classify_severity
+        if action.action_type == ActionType.CONTAIN_THREAT and self._severity_set is None:
+            self._reward_this_step -= 0.03
+            self._classified_before_contain = False
+
+        # Premature report penalty: submit_report without classifying
+        if action.action_type == ActionType.SUBMIT_REPORT and self._severity_set is None:
+            self._reward_this_step -= 0.10
 
         # Route to handler
         handler_map = {
@@ -218,6 +253,8 @@ class IncidentResponseEnvEnvironment(Environment):
             ActionType.ESCALATE: self._handle_escalate,
             ActionType.CLOSE_AS_FALSE_POSITIVE: self._handle_close_fp,
             ActionType.SUBMIT_REPORT: self._handle_submit_report,
+            ActionType.ANALYZE_MALWARE: self._handle_analyze_malware,
+            ActionType.REQUEST_FORENSIC_IMAGE: self._handle_request_forensic_image,
         }
 
         handler = handler_map.get(action.action_type)
@@ -271,6 +308,11 @@ class IncidentResponseEnvEnvironment(Environment):
                 action_result="ERROR: Please specify a log_source: 'firewall', 'edr', 'proxy', 'auth', 'dns', 'email'",
                 steps_remaining=self._scenario.max_steps - self._state.step_count,
             )
+
+        # Discovery bonus: first time querying each log source
+        if log_source not in self._log_sources_queried:
+            self._log_sources_queried.add(log_source)
+            self._reward_this_step += 0.02
 
         # Find matching log entries
         matching_logs = []
@@ -334,6 +376,9 @@ class IncidentResponseEnvEnvironment(Environment):
                 action_result="ERROR: Please specify a query_filter with an IOC (IP, domain, hash, email) to look up.",
                 steps_remaining=self._scenario.max_steps - self._state.step_count,
             )
+
+        # Track which IOCs have been checked for depth bonus
+        self._ti_iocs_checked.add(query)
 
         # Find matching threat intel
         matches = []
@@ -499,6 +544,98 @@ class IncidentResponseEnvEnvironment(Environment):
             steps_remaining=self._scenario.max_steps - self._state.step_count,
         )
 
+    def _handle_analyze_malware(self, action: IncidentAction) -> IncidentObservation:
+        """Deep analysis of suspicious file/process."""
+        s = self._scenario
+        query = (action.query_filter or "").lower()
+
+        if not query:
+            return self._build_observation(
+                findings="No file hash or filename specified for malware analysis.",
+                action_result="ERROR: Specify a query_filter with a file hash or filename to analyze.",
+                steps_remaining=self._scenario.max_steps - self._state.step_count,
+            )
+
+        # Check if query matches a known malware artifact in the scenario's threat intel
+        matched_ti = None
+        for ti in s.threat_intel:
+            if ti.ioc_type == "hash" and (query in ti.ioc.lower() or query in " ".join(ti.keywords).lower()):
+                matched_ti = ti
+                break
+
+        if matched_ti:
+            findings = (
+                f"MALWARE ANALYSIS RESULTS:\n"
+                f"  Hash/Artifact: {matched_ti.ioc}\n"
+                f"  Type: {matched_ti.ioc_type}\n"
+                f"  Analysis: {matched_ti.description}\n"
+                f"  Severity: {matched_ti.severity}\n"
+                f"  Source: {matched_ti.source}\n\n"
+                f"  Recommendation: Quarantine this artifact immediately.\n"
+            )
+            # Award for analyzing a critical IOC
+            if matched_ti.ioc in s.critical_iocs and matched_ti.ioc not in self._iocs_discovered:
+                self._iocs_discovered.add(matched_ti.ioc)
+                self._state.iocs_found = list(self._iocs_discovered)
+            self._reward_this_step += 0.03
+        else:
+            findings = (
+                f"MALWARE ANALYSIS: No detailed analysis available for '{query}'. "
+                f"The artifact may not be in the threat intelligence database, or "
+                f"the query does not match a known malware sample in this scenario."
+            )
+
+        return self._build_observation(
+            findings=findings,
+            action_result="Malware analysis complete.",
+            steps_remaining=self._scenario.max_steps - self._state.step_count,
+        )
+
+    def _handle_request_forensic_image(self, action: IncidentAction) -> IncidentObservation:
+        """Request full disk image for forensics."""
+        endpoint_id = (action.endpoint_id or "").lower()
+
+        if not endpoint_id:
+            return self._build_observation(
+                findings="No endpoint specified for forensic image request.",
+                action_result="ERROR: Specify an endpoint_id for the forensic image request.",
+                steps_remaining=self._scenario.max_steps - self._state.step_count,
+            )
+
+        # Check if the endpoint exists
+        endpoint = None
+        for ep in self._scenario.endpoints:
+            if (endpoint_id in ep.endpoint_id.lower() or
+                endpoint_id in ep.hostname.lower() or
+                endpoint_id in ep.ip.lower()):
+                endpoint = ep
+                break
+
+        if endpoint:
+            findings = (
+                f"FORENSIC IMAGE REQUEST:\n"
+                f"  Endpoint: {endpoint.hostname} ({endpoint.ip})\n"
+                f"  Status: Image collection initiated\n"
+                f"  Estimated Time: 2-4 hours (full disk image)\n"
+                f"  Format: E01 (EnCase Evidence File)\n"
+                f"  Chain of Custody: Logged and timestamped\n\n"
+                f"  NOTE: Forensic image will preserve volatile and non-volatile "
+                f"data for detailed offline analysis. Proper IR procedure followed."
+            )
+            self._reward_this_step += 0.02
+        else:
+            available = ", ".join(f"{ep.hostname}({ep.ip})" for ep in self._scenario.endpoints)
+            findings = (
+                f"Endpoint '{endpoint_id}' not found for forensic imaging.\n"
+                f"Available endpoints: {available}"
+            )
+
+        return self._build_observation(
+            findings=findings,
+            action_result="Forensic image request processed.",
+            steps_remaining=self._scenario.max_steps - self._state.step_count,
+        )
+
     # =========================================================================
     # Response Action Handlers
     # =========================================================================
@@ -511,6 +648,10 @@ class IncidentResponseEnvEnvironment(Environment):
                 action_result="ERROR: Set 'severity' field to: critical, high, medium, low, or informational",
                 steps_remaining=self._scenario.max_steps - self._state.step_count,
             )
+
+        # Track if agent investigated before classifying
+        if len(self._evidence_discovered) > 0 or len(self._log_sources_queried) >= 2:
+            self._investigated_before_classify = True
 
         self._severity_set = action.severity
         self._state.severity_classified = True
@@ -575,13 +716,7 @@ class IncidentResponseEnvEnvironment(Environment):
             self._state.containment_executed = True
 
             # Check if this containment action matches ground truth
-            is_correct = False
-            for req_action in self._scenario.required_containment:
-                if ca == req_action:
-                    expected_target = self._scenario.containment_targets.get(ca.value, "")
-                    if action.target.lower() in expected_target.lower() or expected_target.lower() in action.target.lower():
-                        is_correct = True
-                        break
+            is_correct = self._check_containment_correct(ca.value, action.target)
 
             if is_correct:
                 self._reward_this_step += 0.06
@@ -589,8 +724,8 @@ class IncidentResponseEnvEnvironment(Environment):
             elif ca == ContainmentAction.NONE:
                 results.append(f"  [INFO] No containment action taken")
             else:
-                # Wrong target or unnecessary action
-                self._reward_this_step -= 0.04
+                # Wrong target or unnecessary action — stronger penalty
+                self._reward_this_step -= 0.05
                 results.append(f"  [EXECUTED] {ca.value} on {action.target} - Action completed (verify target correctness)")
 
         findings = "CONTAINMENT ACTIONS EXECUTED:\n" + "\n".join(results)
@@ -601,17 +736,43 @@ class IncidentResponseEnvEnvironment(Environment):
             steps_remaining=self._scenario.max_steps - self._state.step_count,
         )
 
+    def _check_containment_correct(self, action_value: str, target: str) -> bool:
+        """Check if a containment action+target pair is correct."""
+        s = self._scenario
+        target_lower = target.lower()
+
+        # New pair-based grading (for new scenarios)
+        if s.required_containment_pairs:
+            for req_action, req_target in s.required_containment_pairs:
+                if action_value == req_action:
+                    if target_lower in req_target.lower() or req_target.lower() in target_lower:
+                        return True
+            return False
+
+        # Legacy dict-based grading (for existing 3 scenarios)
+        for req_action in s.required_containment:
+            if action_value == req_action.value:
+                expected_target = s.containment_targets.get(req_action.value, "")
+                if target_lower in expected_target.lower() or expected_target.lower() in target_lower:
+                    return True
+        return False
+
     def _handle_escalate(self, action: IncidentAction) -> IncidentObservation:
         """Escalate the incident."""
         escalate_to = action.escalate_to or "tier2"
         self._escalated_to = escalate_to.lower()
 
         if self._scenario.correct_escalation:
-            if self._escalated_to == self._scenario.correct_escalation:
+            # For expert scenario, accept multiple valid escalation targets
+            valid_escalations = [self._scenario.correct_escalation]
+            if self._task_id == "expert":
+                valid_escalations = ["tier3", "management", "legal"]
+
+            if self._escalated_to in valid_escalations:
                 self._reward_this_step += 0.05
                 result = f"Incident escalated to {escalate_to}. Appropriate escalation target."
             else:
-                self._reward_this_step += 0.01  # Some credit for escalating at all
+                self._reward_this_step -= 0.02  # Wrong escalation target
                 result = f"Incident escalated to {escalate_to}."
         else:
             # Unnecessary escalation
@@ -667,6 +828,26 @@ class IncidentResponseEnvEnvironment(Environment):
         completeness = self._calculate_investigation_completeness()
         self._reward_this_step += completeness * 0.05
 
+        # Investigation breadth bonus: all 6 log sources queried
+        if len(self._log_sources_queried) >= 6:
+            self._reward_this_step += 0.05
+
+        # Depth bonus: for scenarios with 4+ critical IOCs, reward checking TI on 3+
+        if len(self._scenario.critical_iocs) >= 4 and len(self._ti_iocs_checked) >= 3:
+            self._reward_this_step += 0.03
+
+        # Evidence chain coherence: investigated before classifying
+        if self._investigated_before_classify:
+            self._reward_this_step += 0.03
+
+        # Correct escalation reward at report time
+        if self._scenario.correct_escalation and self._escalated_to:
+            valid_escalations = [self._scenario.correct_escalation]
+            if self._task_id == "expert":
+                valid_escalations = ["tier3", "management", "legal"]
+            if self._escalated_to in valid_escalations:
+                self._reward_this_step += 0.05
+
         self._total_reward += self._reward_this_step
 
         return self._build_observation(
@@ -694,13 +875,17 @@ class IncidentResponseEnvEnvironment(Environment):
         Compute the final grader score for the episode (0.0 - 1.0).
 
         Scoring breakdown:
-        - Investigation thoroughness (evidence): 25%
-        - IOC identification: 15%
-        - Severity classification: 15%
-        - Threat categorization: 10%
-        - Containment actions: 20%
-        - Report quality: 10%
+        - Investigation thoroughness (evidence discovery): 20%
+        - IOC identification: 10%
+        - Correct severity classification: 10%
+        - Correct threat categorization: 8%
+        - Containment completeness: 15%
+        - Containment precision (penalize wrong targets): 7%
+        - Report quality: 8%
         - Efficiency: 5%
+        - Escalation accuracy: 5%
+        - Evidence chain coherence: 7%
+        - Phase discipline: 5%
 
         Returns:
             Float score between 0.0 and 1.0
@@ -710,43 +895,47 @@ class IncidentResponseEnvEnvironment(Environment):
 
         score = 0.0
 
-        # 1. Investigation thoroughness (25%)
+        # 1. Investigation thoroughness (20%)
         completeness = self._calculate_investigation_completeness()
-        score += 0.25 * completeness
+        score += 0.20 * completeness
 
-        # 2. IOC identification (15%)
+        # 2. IOC identification (10%)
         ioc_ratio = len(self._iocs_discovered & self._scenario.critical_iocs) / max(
             len(self._scenario.critical_iocs), 1
         )
-        score += 0.15 * ioc_ratio
+        score += 0.10 * ioc_ratio
 
-        # 3. Severity classification (15%)
+        # 3. Severity classification (10%)
         if self._severity_set is not None:
             if self._severity_set == self._scenario.true_severity:
-                score += 0.15
+                score += 0.10
             else:
                 severity_order = [Severity.INFO, Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL]
                 true_idx = severity_order.index(self._scenario.true_severity)
                 set_idx = severity_order.index(self._severity_set)
                 distance = abs(true_idx - set_idx)
-                score += 0.15 * max(0, 1.0 - distance * 0.35)
+                score += 0.10 * max(0, 1.0 - distance * 0.35)
 
-        # 4. Threat categorization (10%)
+        # 4. Threat categorization (8%)
         if self._category_set == self._scenario.true_category:
-            score += 0.10
+            score += 0.08
         elif self._category_set is not None:
             score += 0.02  # At least attempted
 
-        # 5. Containment actions (20%)
+        # 5. Containment completeness (15%)
         containment_score = self._grade_containment()
-        score += 0.20 * containment_score
+        score += 0.15 * max(0.0, containment_score)
 
-        # 6. Report quality (10%)
+        # 6. Containment precision (7%) - penalize wrong targets
+        precision_score = self._grade_containment_precision()
+        score += 0.07 * precision_score
+
+        # 7. Report quality (8%)
         if self._report_submitted:
             report_grade = self._grade_report(self._report_text) / 0.10  # Normalize
-            score += 0.10 * min(1.0, max(0.0, report_grade))
+            score += 0.08 * min(1.0, max(0.0, report_grade))
 
-        # 7. Efficiency (5%)
+        # 8. Efficiency (5%)
         if self._state.step_count > 0:
             expected_max = self._scenario.max_steps
             usage_ratio = self._state.step_count / expected_max
@@ -757,33 +946,93 @@ class IncidentResponseEnvEnvironment(Environment):
             elif usage_ratio <= 1.0:
                 score += 0.01
 
-        # 8. Penalty for closing real incident as FP
+        # 9. Escalation accuracy (5%)
+        if self._scenario.correct_escalation:
+            valid_escalations = [self._scenario.correct_escalation]
+            if self._task_id == "expert":
+                valid_escalations = ["tier3", "management", "legal"]
+            if self._escalated_to in valid_escalations:
+                score += 0.05
+            elif self._escalated_to is not None:
+                score += 0.01  # Partial credit for escalating at all
+        else:
+            # No escalation needed
+            if self._escalated_to is None:
+                score += 0.05  # Correctly did not escalate
+            else:
+                score += 0.02  # Unnecessary escalation but not terrible
+
+        # 10. Evidence chain coherence (7%)
+        if self._investigated_before_classify:
+            score += 0.07
+        elif len(self._evidence_discovered) > 0:
+            score += 0.03  # Partial — did some investigation
+
+        # 11. Phase discipline (5%)
+        if self._classified_before_contain:
+            score += 0.05
+        else:
+            score += 0.01  # Partial for at least containing
+
+        # Penalty for closing real incident as FP
         if self._closed_as_fp and not self._scenario.is_false_positive:
             score = max(0.0, score - 0.30)
 
         return round(min(1.0, max(0.0, score)), 4)
 
     def _grade_containment(self) -> float:
-        """Grade containment actions. Returns 0.0-1.0."""
-        if not self._scenario.required_containment:
+        """Grade containment completeness. Returns 0.0-1.0."""
+        s = self._scenario
+
+        # New pair-based grading (for new scenarios)
+        if s.required_containment_pairs:
+            if not s.required_containment_pairs:
+                return 1.0 if not self._containment_executed else 0.5
+
+            correct = 0
+            total_required = len(s.required_containment_pairs)
+
+            for req_action, req_target in s.required_containment_pairs:
+                for exec_action, exec_target in self._containment_executed:
+                    if exec_action == req_action:
+                        if req_target.lower() in exec_target.lower() or exec_target.lower() in req_target.lower():
+                            correct += 1
+                            break
+
+            return correct / max(total_required, 1)
+
+        # Legacy grading (for existing 3 scenarios)
+        if not s.required_containment:
             return 1.0 if not self._containment_executed else 0.5
 
         correct = 0
-        total_required = len(self._scenario.required_containment)
+        total_required = len(s.required_containment)
 
-        for req_action in self._scenario.required_containment:
-            expected_target = self._scenario.containment_targets.get(req_action.value, "")
+        for req_action in s.required_containment:
+            expected_target = s.containment_targets.get(req_action.value, "")
             for exec_action, exec_target in self._containment_executed:
                 if exec_action == req_action.value:
                     if expected_target.lower() in exec_target.lower() or exec_target.lower() in expected_target.lower():
                         correct += 1
                         break
 
-        # Penalty for wrong containment actions
-        wrong_actions = len(self._containment_executed) - correct
-        penalty = wrong_actions * 0.1
+        return correct / max(total_required, 1)
 
-        return max(0.0, (correct / max(total_required, 1)) - penalty)
+    def _grade_containment_precision(self) -> float:
+        """Grade containment precision (penalize wrong targets). Returns 0.0-1.0."""
+        if not self._containment_executed:
+            return 1.0  # No actions = no wrong actions
+
+        correct_count = 0
+        for exec_action, exec_target in self._containment_executed:
+            if self._check_containment_correct(exec_action, exec_target):
+                correct_count += 1
+
+        total = len(self._containment_executed)
+        wrong = total - correct_count
+        # Each wrong action reduces precision
+        precision = max(0.0, 1.0 - (wrong * 0.2))
+        return precision
 
     def _grade_report(self, report: str) -> float:
         """Grade the incident report quality. Returns reward value."""
@@ -834,10 +1083,10 @@ class IncidentResponseEnvEnvironment(Environment):
         expected_max = self._scenario.max_steps
         usage_ratio = self._state.step_count / expected_max
 
-        if usage_ratio <= 0.5:
+        if usage_ratio <= 0.6:
+            return 0.05
+        elif usage_ratio <= 0.8:
             return 0.03
-        elif usage_ratio <= 0.7:
-            return 0.01
         else:
             return 0.0
 
@@ -899,6 +1148,51 @@ class IncidentResponseEnvEnvironment(Environment):
             "monitoring": "search_queries_monitoring_evasion",
             "volume": "data_volume_anomaly",
             "data_transfer": "data_volume_anomaly",
+            # Medium-Hard (Ransomware) scenario mappings
+            "rdp_bruteforce_external": "rdp_bruteforce_external",
+            "cobalt_strike_beacon": "cobalt_strike_beacon",
+            "cobalt_strike": "cobalt_strike_beacon",
+            "lateral_movement_psexec": "lateral_movement_psexec",
+            "psexec": "lateral_movement_psexec",
+            "ransomware_encryption": "ransomware_encryption",
+            "locker": "ransomware_encryption",
+            "ransomware": "ransomware_encryption",
+            "c2_communication": "c2_communication",
+            "credential_phishing": "credential_phishing",
+            "spearphish": "credential_phishing",
+            # Hard-Plus (Supply Chain) scenario mappings
+            "buildforge": "buildforge_hash_mismatch",
+            "bf_helper_backdoor": "bf_helper_backdoor",
+            "code_exfiltration": "code_exfiltration_telemetry",
+            "code_exfiltration_telemetry": "code_exfiltration_telemetry",
+            "telemetry": "code_exfiltration_telemetry",
+            "cryptominer_deployment": "cryptominer_deployment",
+            "xmrig": "cryptominer_deployment",
+            "mining": "cryptominer_deployment",
+            "stolen_signing_cert": "stolen_signing_cert",
+            "phishing_build_team": "phishing_build_team",
+            "supply_chain": "buildforge_hash_mismatch",
+            "build_svc_token_misuse": "build_svc_token_misuse",
+            "service_token": "build_svc_token_misuse",
+            "unauthorized": "build_svc_token_misuse",
+            # Expert (APT Zero-Day) scenario mappings
+            "dns_tunneling_c2": "dns_tunneling_c2",
+            "dns_tunneling": "dns_tunneling_c2",
+            "beacon": "dns_tunneling_c2",
+            "zero_day_confluence_exploit": "zero_day_confluence_exploit",
+            "zero_day": "zero_day_confluence_exploit",
+            "confluence": "zero_day_confluence_exploit",
+            "fileless_implant": "fileless_implant",
+            "fileless": "fileless_implant",
+            "dcsync_credential_theft": "dcsync_credential_theft",
+            "dcsync": "dcsync_credential_theft",
+            "golden_ticket_usage": "golden_ticket_usage",
+            "golden_ticket": "golden_ticket_usage",
+            "kerberos": "golden_ticket_usage",
+            "email_exfiltration": "email_exfiltration",
+            "exchange": "email_exfiltration",
+            "lateral_movement_exchange": "lateral_movement_exchange",
+            "lateral_movement_hr": "lateral_movement_hr",
         }
 
         for kw in keywords:
@@ -1008,7 +1302,17 @@ class IncidentResponseEnvEnvironment(Environment):
                 "severity_correct": self._severity_set == self._scenario.true_severity if self._scenario else False,
                 "category_correct": self._category_set == self._scenario.true_category if self._scenario else False,
                 "containment_score": round(self._grade_containment(), 4),
+                "containment_precision": round(self._grade_containment_precision(), 4),
                 "report_submitted": self._report_submitted,
+                "escalation_correct": (
+                    self._escalated_to in ([self._scenario.correct_escalation] if self._task_id != "expert"
+                                           else ["tier3", "management", "legal"])
+                    if self._scenario and self._scenario.correct_escalation and self._escalated_to
+                    else self._escalated_to is None and (not self._scenario or not self._scenario.correct_escalation)
+                ),
+                "evidence_chain_coherence": self._investigated_before_classify,
+                "phase_discipline": self._classified_before_contain,
+                "log_sources_queried": len(self._log_sources_queried),
                 "steps_used": self._state.step_count,
                 "max_steps": self._scenario.max_steps if self._scenario else 0,
             },

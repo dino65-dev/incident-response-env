@@ -1,4 +1,4 @@
-# 🛡️ Incident Response Triage Environment
+# Incident Response Triage Environment
 
 A real-world cybersecurity **Security Operations Center (SOC) analyst simulation** built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework. AI agents investigate security alerts, gather forensic evidence, correlate findings, classify threats, and execute incident response — exactly like human SOC analysts do every day.
 
@@ -24,16 +24,18 @@ This environment provides the first standardized OpenEnv benchmark for training 
 The agent receives a cybersecurity alert and must:
 
 1. **Investigate** — Examine logs (firewall, EDR, proxy, auth, DNS, email), query threat intelligence, inspect endpoints, check user profiles, correlate events
-2. **Classify** — Determine severity (critical/high/medium/low/info) and threat category (malware, phishing, lateral movement, insider threat, etc.)
+2. **Classify** — Determine severity (critical/high/medium/low/info) and threat category (malware, phishing, lateral movement, insider threat, ransomware, supply chain, APT/zero-day, etc.)
 3. **Respond** — Execute containment actions (isolate hosts, block IPs, disable accounts, quarantine files) with correct targets
 4. **Report** — Submit a comprehensive incident report summarizing findings
 
 ### What Makes It Creative
 
 - **Layered evidence discovery**: Investigation actions progressively reveal forensic artifacts. The agent must piece together the attack narrative from fragmented evidence across multiple data sources — just like a real analyst.
-- **Multi-dimensional reward shaping**: Reward is not binary. The agent earns partial credit for each evidence item discovered, each IOC identified, severity accuracy (with partial credit for adjacent levels), containment correctness, and report quality. This provides rich learning signal across the full trajectory.
-- **Behavioral deception (hard task)**: The hardest scenario involves an insider threat where all activity appears legitimate on the surface. The agent must correlate subtle behavioral anomalies (after-hours access patterns, anomalous file scope, job search history, HR context) to distinguish malicious intent from routine work.
-- **Anti-loop penalties**: Repeated identical actions receive diminishing returns, encouraging diverse investigation strategies.
+- **Multi-dimensional reward shaping**: Reward is not binary. The agent earns partial credit across 11 grading dimensions including evidence discovery, IOC identification, severity/category accuracy, containment completeness and precision, report quality, efficiency, escalation accuracy, evidence chain coherence, and phase discipline.
+- **Progressive difficulty**: Six scenarios span easy to expert difficulty, from clear-cut phishing through multi-stage ransomware and supply chain attacks to an advanced persistent threat with zero-day exploitation and DNS tunneling C2.
+- **Behavioral deception**: The insider threat scenario involves activity that appears legitimate on the surface. The agent must correlate subtle behavioral anomalies to distinguish malicious intent from routine work.
+- **Anti-loop penalties**: Repeated identical actions receive increasing penalties, encouraging diverse investigation strategies.
+- **Phase discipline**: Agents are rewarded for following proper IR workflow (investigate before classify, classify before contain) and penalized for phase violations.
 
 ---
 
@@ -43,13 +45,13 @@ The agent receives a cybersecurity alert and must:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `action_type` | `ActionType` (enum) | **Required.** One of: `examine_alert`, `query_logs`, `check_threat_intel`, `correlate_events`, `inspect_endpoint`, `check_user_history`, `classify_severity`, `contain_threat`, `escalate`, `close_as_false_positive`, `submit_report` |
+| `action_type` | `ActionType` (enum) | **Required.** One of: `examine_alert`, `query_logs`, `check_threat_intel`, `correlate_events`, `inspect_endpoint`, `check_user_history`, `classify_severity`, `contain_threat`, `escalate`, `close_as_false_positive`, `submit_report`, `analyze_malware`, `request_forensic_image` |
 | `log_source` | `str` | Log source for `query_logs`: `firewall`, `edr`, `proxy`, `auth`, `dns`, `email` |
-| `query_filter` | `str` | Filter/keyword for log queries or threat intel lookups (e.g., an IP address, domain, file hash) |
-| `endpoint_id` | `str` | Hostname or IP for `inspect_endpoint` |
+| `query_filter` | `str` | Filter/keyword for log queries, threat intel lookups, or malware analysis (e.g., an IP address, domain, file hash) |
+| `endpoint_id` | `str` | Hostname or IP for `inspect_endpoint` or `request_forensic_image` |
 | `user_id` | `str` | Username for `check_user_history` |
 | `severity` | `Severity` | For `classify_severity`: `critical`, `high`, `medium`, `low`, `informational` |
-| `threat_category` | `ThreatCategory` | For `classify_severity`: `malware`, `phishing`, `data_exfiltration`, `brute_force`, `insider_threat`, `lateral_movement`, `privilege_escalation`, `false_positive` |
+| `threat_category` | `ThreatCategory` | For `classify_severity`: `malware`, `phishing`, `data_exfiltration`, `brute_force`, `insider_threat`, `lateral_movement`, `privilege_escalation`, `false_positive`, `ransomware`, `supply_chain`, `apt_zero_day` |
 | `containment_actions` | `List[ContainmentAction]` | For `contain_threat`: `isolate_host`, `block_ip`, `disable_account`, `quarantine_file`, `revoke_sessions` |
 | `target` | `str` | Target for containment (hostname, IP, username, or file hash) |
 | `report_summary` | `str` | Final report text for `submit_report` |
@@ -106,9 +108,42 @@ The agent receives a cybersecurity alert and must:
 | **Difficulty** | Hard |
 | **Max Steps** | 30 |
 | **Expected Steps** | 15–25 |
-| **Scenario** | A DLP alert for a director uploading 340MB to personal Google Drive. The user has legitimate access and authorized cloud storage. Agent must distinguish malicious data exfiltration from routine work by correlating behavioral anomalies: after-hours access surge, anomalous file scope, job search activity, recruiter communications, and HR context (passed over for promotion). |
+| **Scenario** | A DLP alert for a director uploading 340MB to personal Google Drive. The user has legitimate access and authorized cloud storage. Agent must distinguish malicious data exfiltration from routine work by correlating behavioral anomalies: after-hours access patterns, anomalous file scope, job search history, recruiter communications, and HR context (passed over for promotion). |
 | **Key Skills** | Behavioral analysis, intent determination, contextual correlation |
 | **Ground Truth** | Severity: CRITICAL, Category: Insider Threat, Containment: Disable account + Revoke sessions, Escalation: Management |
+
+### Task 4: Ransomware Deployment & Encryption (Medium-Hard)
+
+| Property | Value |
+|----------|-------|
+| **Difficulty** | Medium-Hard |
+| **Max Steps** | 25 |
+| **Expected Steps** | 15–22 |
+| **Scenario** | EDR alerts on multiple hosts encrypting files simultaneously after hours. Entry via compromised RDP credentials to an admin workstation. Cobalt Strike beacon deployed, lateral movement via PsExec, then LockBit ransomware variant deployed to 3 servers. Ransom note found on each host. Agent must trace the full kill chain from initial RDP brute-force through C2 establishment, lateral movement, and encryption deployment. |
+| **Key Skills** | Kill chain reconstruction, ransomware triage, C2 identification, multi-host containment |
+| **Ground Truth** | Severity: CRITICAL, Category: Ransomware, Containment: Isolate hosts + Block IPs + Disable account + Revoke sessions, Escalation: Tier 3 |
+
+### Task 5: Software Supply Chain Compromise (Hard-Plus)
+
+| Property | Value |
+|----------|-------|
+| **Difficulty** | Hard-Plus |
+| **Max Steps** | 30 |
+| **Expected Steps** | 18–26 |
+| **Scenario** | A trusted internal build tool (BuildForge) pushes a compromised update containing a backdoor that exfiltrates source code and deploys a cryptominer. The compromised package was signed with a stolen code-signing certificate. 8 developer workstations affected in a staged rollout. Agent must identify the supply chain vector, assess blast radius, and contain compromised CI/CD credentials. |
+| **Key Skills** | Supply chain analysis, code-signing verification, CI/CD security, blast radius assessment |
+| **Ground Truth** | Severity: CRITICAL, Category: Supply Chain, Containment: Isolate host + Quarantine file + Disable account + Revoke sessions, Escalation: Management |
+
+### Task 6: APT with Zero-Day Exploitation (Expert)
+
+| Property | Value |
+|----------|-------|
+| **Difficulty** | Expert |
+| **Max Steps** | 35 |
+| **Expected Steps** | 22–32 |
+| **Scenario** | An Advanced Persistent Threat group ("Midnight Storm") exploits a zero-day in Confluence Server for initial access. They deploy a memory-resident implant (fileless), use living-off-the-land techniques for persistence, harvest credentials via DCSync, forge Golden Tickets, and establish covert C2 via DNS tunneling. The attack has been ongoing for 7 days before detection. Agent must unravel a sophisticated multi-stage intrusion spanning DNS tunneling C2, credential theft, lateral movement to Exchange and HR servers, and executive email exfiltration. |
+| **Key Skills** | APT analysis, DNS tunneling detection, DCSync/Golden Ticket identification, fileless malware investigation |
+| **Ground Truth** | Severity: CRITICAL, Category: APT/Zero-Day, Containment: Isolate hosts + Block IP + Disable accounts + Revoke sessions, Escalation: Tier 3 / Management / Legal |
 
 ---
 
@@ -118,13 +153,17 @@ The agent receives a cybersecurity alert and must:
 
 | Component | Weight | Description |
 |-----------|--------|-------------|
-| Investigation Completeness | 25% | Fraction of critical evidence items discovered |
-| IOC Identification | 15% | Fraction of critical IOCs found |
-| Severity Classification | 15% | Exact match = full, adjacent = partial, far off = penalized |
-| Threat Categorization | 10% | Correct category identification |
-| Containment Actions | 20% | Correct actions on correct targets, penalties for wrong targets |
-| Report Quality | 10% | Keyword coverage, IOC mentions, report length |
+| Investigation Thoroughness | 20% | Fraction of critical evidence items discovered |
+| IOC Identification | 10% | Fraction of critical IOCs found |
+| Severity Classification | 10% | Exact match = full, adjacent = partial, far off = penalized |
+| Threat Categorization | 8% | Correct category identification |
+| Containment Completeness | 15% | Fraction of required containment actions executed on correct targets |
+| Containment Precision | 7% | Penalty for wrong-target containment actions |
+| Report Quality | 8% | Keyword coverage, IOC mentions, report length |
 | Efficiency | 5% | Bonus for completing within expected step range |
+| Escalation Accuracy | 5% | Correct escalation target selection |
+| Evidence Chain Coherence | 7% | Whether agent followed a logical investigation path before classifying |
+| Phase Discipline | 5% | Proper IR workflow ordering (investigate → classify → contain → report) |
 
 ### Step-Level Reward Shaping
 
@@ -132,14 +171,22 @@ The reward function provides **meaningful signal over the full trajectory**, not
 
 - **+0.03** per critical evidence item discovered
 - **+0.02–0.03** per IOC identified
+- **+0.02** per new log source queried (discovery bonus for investigation breadth)
+- **+0.03** depth bonus for checking threat intel on 3+ critical IOCs
 - **+0.10** for correct severity classification (+0.03 for adjacent)
 - **+0.08** for correct threat categorization
 - **+0.06** per correct containment action on correct target
 - **+0.05** for correct escalation target
+- **+0.05** breadth bonus if all 6 log sources queried by report time
+- **+0.05** time pressure bonus for completing within 60% of max steps (+0.03 within 80%)
+- **+0.03** evidence chain coherence bonus for investigating before classifying
 - **+0.01–0.04** for report quality components
-- **−0.02** for repeating the same action 3+ times (anti-loop)
-- **−0.04** per wrong containment target (penalizes destructive actions)
+- **−0.05** for repeating the same action 3+ times (anti-loop)
+- **−0.05** per wrong containment target
+- **−0.03** phase violation: contain before classify
+- **−0.10** phase violation: report without classify
 - **−0.05** for significantly wrong severity
+- **−0.02** for wrong escalation target
 - **−0.20** for closing a real incident as false positive
 - **−0.10** for timeout without resolution
 
@@ -154,27 +201,29 @@ Deterministic baseline (scripted optimal agent, seed=42):
 | Easy (Phishing) | 0.9400 | 17 |
 | Medium (Lateral Movement) | 0.8600 | 19 |
 | Hard (Insider Threat) | 0.9175 | 18 |
-| **Mean** | **0.9058** | — |
+| Medium-Hard (Ransomware) | — | — |
+| Hard-Plus (Supply Chain) | — | — |
+| Expert (APT Zero-Day) | — | — |
 
-The deterministic baseline achieves high scores because it follows the optimal investigation path. An LLM agent faces the challenge of discovering this path through observation and reasoning alone.
+The deterministic baseline achieves high scores because it follows the optimal investigation path. An LLM agent faces the challenge of discovering this path through observation and reasoning alone. Baseline scores for new tasks will be populated after initial runs.
 
 ---
 
 ## LLM Agent Architecture
 
-The `baseline_inference.py` agent implements state-of-the-art techniques from recent research:
+The `baseline_inference.py` agent implements the following techniques:
 
-### ReflAct Reasoning (Kim et al., 2025)
-At each step, the agent reflects on its **current state relative to the investigation goal** before choosing an action — preventing the goal-drift and hallucination that plague standard ReAct agents. This approach achieves 27.7% improvement over ReAct on decision-making benchmarks ([arXiv:2505.15182](https://arxiv.org/abs/2505.15182)).
+### State-Goal Reflection
+At each step, the agent reflects on its **current state relative to the investigation goal** before choosing an action — preventing goal-drift and hallucination that plague standard reactive agents.
 
-### Pre-Act Planning (Rawat et al., 2025)
-The agent generates a **multi-step investigation plan** upfront (INVESTIGATE → CLASSIFY → CONTAIN → REPORT) and tracks progress against it. This incremental planning outperforms ReAct by 70% on action recall ([arXiv:2505.09970](https://arxiv.org/abs/2505.09970)).
+### Investigation Planning
+The agent generates a **multi-step investigation plan** upfront (INVESTIGATE → CLASSIFY → CONTAIN → REPORT) and tracks progress against it, enabling structured and methodical incident response.
 
-### SOC Playbook Structure (Reynolds, 2025; Baral et al., 2025)
-The phased workflow mirrors real-world SOC incident response playbooks (NIST SP 800-61, SANS IR framework). Research shows that policy-driven LLM agents with structured playbooks reduce analyst workload by 39% and achieve 33% faster mean time-to-respond ([JRPS v16.i4.331](https://jrpsjournal.in/index.php/j/article/view/331); [IEEE IWCMC 2025](https://ieeexplore.ieee.org/document/11059476/)).
+### SOC Playbook Structure
+The phased workflow mirrors real-world SOC incident response playbooks (NIST SP 800-61, SANS IR framework), ensuring agents follow proper IR procedures and phase discipline.
 
-### Focused ReAct Anti-Loop (Li et al., 2024)
-Explicit **repetition detection** and forced progression prevent the agent from getting stuck in action loops — a common failure mode identified in [arXiv:2410.10779](https://arxiv.org/abs/2410.10779).
+### Anti-Loop Detection
+Explicit **repetition detection** and forced progression prevent the agent from getting stuck in action loops — a common failure mode for LLM agents in multi-step environments.
 
 ### Evidence-Grounded Feedback
 Each step includes a **structured state summary** showing discovered evidence, identified IOCs, queried log sources, and current investigation phase — giving the LLM explicit grounding for its next decision.
@@ -270,13 +319,13 @@ openenv push
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/health` | GET | Health check |
-| `/reset` | POST | Reset environment (accepts `task_id`: easy/medium/hard) |
+| `/reset` | POST | Reset environment (accepts `task_id`: easy/medium/hard/medium_hard/hard_plus/expert) |
 | `/step` | POST | Execute an action |
 | `/state` | GET | Get current state |
 | `/schema` | GET | Get action/observation JSON schemas |
-| `/tasks` | GET | List all tasks with descriptions and action schema |
+| `/tasks` | GET | List all 6 tasks with descriptions and action schema |
 | `/grader` | GET | Get grader score after episode completion |
-| `/baseline` | POST | Run deterministic baseline on all 3 tasks |
+| `/baseline` | POST | Run deterministic baseline on all 6 tasks |
 
 ### Example Interaction
 
@@ -342,7 +391,16 @@ print(r.json())  # {"score": 0.85, "breakdown": {...}}
 incident-response-env/
 ├── __init__.py                    # Package exports
 ├── models.py                      # Pydantic Action/Observation/State models
-├── scenarios.py                   # 3 incident scenarios with evidence layers
+├── scenarios.py                   # Backward-compat re-export (scenarios live in tasks/)
+├── tasks/                         # All 6 incident scenarios
+│   ├── __init__.py                # Exports SCENARIOS, TASK_DEFINITIONS
+│   ├── base.py                    # Shared dataclasses (LogEntry, Scenario, etc.)
+│   ├── task_easy_phishing.py      # Easy: Phishing email triage
+│   ├── task_medium_lateral.py     # Medium: Brute force & lateral movement
+│   ├── task_hard_insider.py       # Hard: Insider threat investigation
+│   ├── task_medium_ransomware.py  # Medium-Hard: Ransomware deployment
+│   ├── task_hard_supply_chain.py  # Hard-Plus: Supply chain compromise
+│   └── task_expert_apt_zeroday.py # Expert: APT with zero-day exploitation
 ├── client.py                      # EnvClient implementation
 ├── openenv.yaml                   # OpenEnv configuration
 ├── pyproject.toml                 # Python project metadata
@@ -364,9 +422,9 @@ incident-response-env/
 
 1. **Novel domain for OpenEnv**: No existing SOC/security triage environment in the OpenEnv catalog
 2. **Genuine real-world task**: Every enterprise SOC performs this exact workflow daily
-3. **Rich action space**: 11 distinct action types spanning investigation and response
-4. **Natural difficulty progression**: From clear-cut phishing → multi-stage attacks → ambiguous insider threats
-5. **Multi-dimensional grading**: 7 scoring components prevent gaming via any single dimension
+3. **Rich action space**: 13 distinct action types spanning investigation and response
+4. **Natural difficulty progression**: From clear-cut phishing → multi-stage ransomware → supply chain compromise → sophisticated APT campaigns
+5. **Multi-dimensional grading**: 11 scoring components prevent gaming via any single dimension
 
 ### Reward Design Philosophy
 

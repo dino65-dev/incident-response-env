@@ -6,7 +6,7 @@
 """
 Baseline Inference Script for the Incident Response Triage Environment.
 
-This script runs an LLM agent against all 3 tasks in the environment
+This script runs an LLM agent against all 6 tasks in the environment
 and produces reproducible baseline scores. It demonstrates how an AI agent
 interacts with the environment through the step/reset/state API.
 
@@ -14,21 +14,20 @@ Supports ANY OpenAI-compatible LLM provider via the --api-base flag or
 auto-detection from environment variables.
 
 Architecture:
-    This agent implements a ReflAct-inspired reasoning loop (Kim et al., 2025)
-    combined with Pre-Act multi-step planning (Rawat et al., 2025) and
-    phase-based investigation structure derived from SOC incident response
-    playbooks (Reynolds, 2025; Baral et al., 2025). Key techniques:
+    This agent implements a reasoning loop with state-goal reflection,
+    multi-step investigation planning, and phase-based investigation
+    structure derived from SOC incident response playbooks. Key techniques:
 
-    1. ReflAct reflection: At each step the agent assesses its current state
-       relative to the investigation goal before deciding the next action.
-    2. Pre-Act planning: An investigation plan is generated upfront and
+    1. State-goal reflection: At each step the agent assesses its current
+       state relative to the investigation goal before deciding the next action.
+    2. Investigation planning: An investigation plan is generated upfront and
        tracked across steps, preventing redundant actions and ensuring
        complete evidence coverage.
-    3. Phase enforcement: INVESTIGATE → ANALYZE → RESPOND → REPORT workflow
+    3. Phase enforcement: INVESTIGATE -> ANALYZE -> RESPOND -> REPORT workflow
        mirrors real SOC playbooks (NIST SP 800-61, SANS IR framework).
     4. Few-shot examples: Exact JSON formats for every action type, with
        special emphasis on classify_severity, contain_threat, and
-       submit_report — the actions that require precise parameter formats.
+       submit_report -- the actions that require precise parameter formats.
     5. Evidence tracking: Explicit tracking of discovered evidence and IOCs
        in the prompt context to avoid wasting steps on duplicate actions.
 
@@ -59,18 +58,6 @@ Environment Variables (checked in order):
 
 Output:
     Prints scores for each task and aggregate results.
-
-References:
-    - ReflAct: Kim et al. (2025) "World-Grounded Decision Making in LLM Agents
-      via Goal-State Reflection" arXiv:2505.15182
-    - Pre-Act: Rawat et al. (2025) "Multi-Step Planning and Reasoning Improves
-      Acting in LLM Agents" arXiv:2505.09970
-    - LLM-IRAgent: Reynolds (2025) "Automated Incident Response Playbooks Using
-      Policy-Driven LLM Agents in SOC Operations" JRPS v16.i4.331
-    - ReAct SOC: Baral et al. (2025) "Autonomous Cyber Incident Response Using
-      Reasoning and Action" IEEE IWCMC 2025
-    - Focused ReAct: Li et al. (2024) "Focused ReAct through Reiterate and
-      Early Stop" arXiv:2410.10779
 """
 
 import argparse
@@ -93,12 +80,7 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-# ReflAct-inspired system prompt with Pre-Act planning and few-shot examples.
-# References:
-#   - ReflAct (Kim et al., 2025): Reflect on state-vs-goal before acting
-#   - Pre-Act (Rawat et al., 2025): Create investigation plan upfront
-#   - LLM-IRAgent (Reynolds, 2025): Phase-based SOC playbook structure
-#   - Focused ReAct (Li et al., 2024): Reiterate goal to prevent drift
+# System prompt with state-goal reflection, investigation planning, and few-shot examples.
 SYSTEM_PROMPT = """You are an expert Security Operations Center (SOC) analyst AI agent investigating cybersecurity incidents.
 
 ## INVESTIGATION PROTOCOL (MANDATORY PHASES)
@@ -111,16 +93,20 @@ Inspect ALL endpoints mentioned in findings.
 Check threat intel for EVERY IOC you discover (IPs, domains, hashes, filenames, emails).
 Check user history for any suspicious users.
 Run correlate_events ONCE after gathering sufficient evidence.
+Optionally use analyze_malware for suspicious file hashes and request_forensic_image for compromised hosts.
 
 ### PHASE 2: CLASSIFY (after thorough investigation)
 Use classify_severity with BOTH severity AND threat_category fields.
 Severity levels: critical, high, medium, low, informational
-Threat categories: malware, phishing, data_exfiltration, brute_force, insider_threat, lateral_movement, privilege_escalation, false_positive
+Threat categories: malware, phishing, data_exfiltration, brute_force, insider_threat, lateral_movement, privilege_escalation, false_positive, ransomware, supply_chain, apt_zero_day
 
 CLASSIFICATION GUIDE (use evidence to determine):
 - Phishing emails with malware payload → severity: "high", threat_category: "phishing"
 - Brute force + lateral movement + credential theft → severity: "critical", threat_category: "lateral_movement"
 - Insider stealing data to competitor → severity: "critical", threat_category: "insider_threat"
+- Ransomware deployment with encryption → severity: "critical", threat_category: "ransomware"
+- Supply chain compromise with backdoor → severity: "critical", threat_category: "supply_chain"
+- APT with zero-day, DNS tunneling, DCSync → severity: "critical", threat_category: "apt_zero_day"
 - Simple scanning/probing → severity: "low", threat_category: "false_positive"
 
 ### PHASE 3: CONTAIN (execute ALL needed containment — MULTIPLE CALLS)
@@ -133,13 +119,21 @@ CONTAINMENT GUIDE:
 - Compromised host → {"action_type": "contain_threat", "containment_actions": ["isolate_host"], "target": "<hostname>"}
 - Malicious IP → {"action_type": "contain_threat", "containment_actions": ["block_ip"], "target": "<ip_address>"}
 - Compromised account → {"action_type": "contain_threat", "containment_actions": ["disable_account", "revoke_sessions"], "target": "<username>"}
-- You will typically need 2-4 separate contain_threat calls with different targets
+- Ransomware: isolate pivot host + encrypted servers, block C2 IPs, disable compromised account
+- Supply chain: isolate affected hosts, quarantine malicious binary, disable compromised service account
+- APT: isolate compromised servers, block attacker IP, disable compromised accounts (both service and admin)
+- You will typically need 2-6 separate contain_threat calls with different targets
 
-### PHASE 4: REPORT (submit comprehensive report)
+### PHASE 4: ESCALATE (if needed)
+- Tier 3 for complex attacks (lateral movement, ransomware, APT)
+- Management for insider threats, supply chain compromises
+- Legal for APT with data exfiltration, compliance implications
+
+### PHASE 5: REPORT (submit comprehensive report)
 Use submit_report with a detailed report_summary (50+ words).
 Include: incident type, IOCs found, evidence summary, severity justification, containment actions taken, and recommendations.
 
-## REFLACT REASONING (DO THIS EVERY STEP)
+## REASONING (DO THIS EVERY STEP)
 Before choosing your action, reflect using this format:
 
 REFLECTION: [What evidence have I gathered so far? What is my current investigation state?]
@@ -157,7 +151,7 @@ ACTION: <the JSON action>
 - Make SEPARATE contain_threat calls for EACH different target (file hash, hostname, IP, username)
 - submit_report MUST have a detailed report_summary (50+ words mentioning IOCs and findings)
 - ALWAYS submit_report before running out of steps
-- Follow the exact phase order: INVESTIGATE → CLASSIFY → CONTAIN → REPORT
+- Follow the exact phase order: INVESTIGATE → CLASSIFY → CONTAIN → ESCALATE → REPORT
 
 ## JSON ACTION FORMAT (respond with ONLY a JSON object)
 
@@ -187,21 +181,31 @@ Example actions for each type:
 6. Correlate events:
 {"action_type": "correlate_events"}
 
-7. Classify severity (MUST include BOTH fields):
+7. Analyze malware:
+{"action_type": "analyze_malware", "query_filter": "e5f6a7b8c9d0..."}
+
+8. Request forensic image:
+{"action_type": "request_forensic_image", "endpoint_id": "CONF-SRV-01"}
+
+9. Classify severity (MUST include BOTH fields):
 {"action_type": "classify_severity", "severity": "critical", "threat_category": "lateral_movement"}
 {"action_type": "classify_severity", "severity": "high", "threat_category": "phishing"}
+{"action_type": "classify_severity", "severity": "critical", "threat_category": "ransomware"}
+{"action_type": "classify_severity", "severity": "critical", "threat_category": "supply_chain"}
+{"action_type": "classify_severity", "severity": "critical", "threat_category": "apt_zero_day"}
 
-8. Contain threat (MUST include BOTH containment_actions list AND target):
+10. Contain threat (MUST include BOTH containment_actions list AND target):
 {"action_type": "contain_threat", "containment_actions": ["isolate_host"], "target": "WS-JSMITH-PC"}
 {"action_type": "contain_threat", "containment_actions": ["block_ip"], "target": "185.220.101.42"}
 {"action_type": "contain_threat", "containment_actions": ["disable_account", "revoke_sessions"], "target": "jsmith"}
 {"action_type": "contain_threat", "containment_actions": ["quarantine_file"], "target": "a3f2b8c1d4e5..."}
 
-9. Escalate:
+11. Escalate:
 {"action_type": "escalate", "escalate_to": "tier3"}
 {"action_type": "escalate", "escalate_to": "management"}
+{"action_type": "escalate", "escalate_to": "legal"}
 
-10. Submit report (MUST be detailed, 50+ words):
+12. Submit report (MUST be detailed, 50+ words):
 {"action_type": "submit_report", "report_summary": "INCIDENT REPORT: [Type] incident detected. Severity: [level]. IOCs identified: [list IOCs]. Evidence: [summarize findings]. Containment: [actions taken]. The attack vector was [description]. Recommend [next steps]. Classification: [category]."}
 
 RESPOND WITH ONLY THE JSON ACTION OBJECT. No markdown, no code blocks, no extra text."""
@@ -221,6 +225,7 @@ VALID_ACTION_TYPES = {
     "correlate_events", "inspect_endpoint", "check_user_history",
     "classify_severity", "contain_threat", "escalate",
     "close_as_false_positive", "submit_report",
+    "analyze_malware", "request_forensic_image",
 }
 
 
@@ -321,9 +326,8 @@ def build_state_summary(
     report_submitted: bool,
 ) -> str:
     """
-    Build a concise state summary for the ReflAct reflection.
-    This tracks what the agent has done and what it still needs to do,
-    following ReflAct's principle of grounding decisions in state-vs-goal.
+    Build a concise state summary for reflection.
+    Tracks what the agent has done and what it still needs to do.
     """
     log_sources_queried = set()
     for a in actions_taken:
@@ -376,17 +380,11 @@ def run_llm_agent(
     extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     """
-    Run the LLM agent against a single task using ReflAct reasoning.
-
-    Architecture:
-        - ReflAct-style state-goal reflection at each step
-        - Phase-based investigation flow (INVESTIGATE→CLASSIFY→CONTAIN→REPORT)
-        - Explicit evidence/IOC tracking to prevent redundant actions
-        - Urgency detection for step-limited episodes
+    Run the LLM agent against a single task using state-goal reflection reasoning.
 
     Args:
         base_url: Environment server URL
-        task_id: Task to run (easy/medium/hard)
+        task_id: Task to run (easy/medium/hard/medium_hard/hard_plus/expert)
         client: OpenAI client
         model: Model to use
         verbose: Print detailed output
@@ -407,7 +405,7 @@ def run_llm_agent(
 
     observation = reset_data.get("observation", {})
 
-    # Pre-Act: Generate initial investigation plan in the first user message
+    # Generate initial investigation plan in the first user message
     initial_prompt = (
         f"TASK: {task_id.upper()} difficulty incident investigation\n\n"
         f"ALERT ID: {observation.get('alert_id', 'N/A')}\n"
@@ -423,7 +421,8 @@ def run_llm_agent(
         "5. Correlate events\n"
         "6. Classify severity and threat category\n"
         "7. Execute containment actions with correct targets\n"
-        "8. Submit comprehensive report\n\n"
+        "8. Escalate if needed\n"
+        "9. Submit comprehensive report\n\n"
         "Begin with step 1. Respond with ONLY a JSON action."
     )
 
@@ -437,7 +436,7 @@ def run_llm_agent(
     max_agent_steps = 30
     done = False
 
-    # State tracking for ReflAct reflection
+    # State tracking for reflection
     evidence_collected = observation.get("evidence_collected", [])
     iocs_discovered = observation.get("iocs_discovered", [])
     investigation_progress = 0.0
@@ -512,7 +511,7 @@ def run_llm_agent(
         if action.get("user_id"):
             action_key += f":{action['user_id']}"
 
-        # Detect repetition and force progression (Focused ReAct: Li et al., 2024)
+        # Detect repetition and force progression
         if action_key == last_action_key:
             consecutive_same_action += 1
         else:
@@ -532,7 +531,7 @@ def run_llm_agent(
                 print(f"  Step {step_num + 1}: STUCK on {action_key}, forcing smart progression")
 
             # Smart forced progression: pick the most useful next action
-            # Priority: unqueried log sources → classify → contain → report
+            # Priority: unqueried log sources -> classify -> contain -> report
             missing_sources = [s for s in ALL_LOG_SOURCES if s not in log_sources_queried]
 
             if missing_sources and not severity_set:
@@ -543,8 +542,14 @@ def run_llm_agent(
             elif not severity_set:
                 # All logs queried but haven't classified yet
                 # Use context-aware defaults based on task difficulty
-                severity_map = {"easy": "high", "medium": "critical", "hard": "critical"}
-                category_map = {"easy": "phishing", "medium": "lateral_movement", "hard": "insider_threat"}
+                severity_map = {
+                    "easy": "high", "medium": "critical", "hard": "critical",
+                    "medium_hard": "critical", "hard_plus": "critical", "expert": "critical",
+                }
+                category_map = {
+                    "easy": "phishing", "medium": "lateral_movement", "hard": "insider_threat",
+                    "medium_hard": "ransomware", "hard_plus": "supply_chain", "expert": "apt_zero_day",
+                }
                 action = {
                     "action_type": "classify_severity",
                     "severity": severity_map.get(task_id, "high"),
@@ -576,8 +581,14 @@ def run_llm_agent(
 
         # Urgency: force progression when running low on steps
         if steps_remaining <= 4 and not severity_set:
-            severity_map = {"easy": "high", "medium": "critical", "hard": "critical"}
-            category_map = {"easy": "phishing", "medium": "lateral_movement", "hard": "insider_threat"}
+            severity_map = {
+                "easy": "high", "medium": "critical", "hard": "critical",
+                "medium_hard": "critical", "hard_plus": "critical", "expert": "critical",
+            }
+            category_map = {
+                "easy": "phishing", "medium": "lateral_movement", "hard": "insider_threat",
+                "medium_hard": "ransomware", "hard_plus": "supply_chain", "expert": "apt_zero_day",
+            }
             action = {
                 "action_type": "classify_severity",
                 "severity": severity_map.get(task_id, "high"),
@@ -678,7 +689,7 @@ def run_llm_agent(
         if action.get("action_type") == "submit_report":
             report_submitted = True
 
-        # Build ReflAct state summary for feedback
+        # Build state summary for feedback
         state_summary = build_state_summary(
             actions_taken=actions_taken,
             evidence_collected=evidence_collected,
@@ -828,8 +839,8 @@ def main():
     parser.add_argument(
         "--tasks",
         nargs="+",
-        default=["easy", "medium", "hard"],
-        help="Tasks to run (default: all)",
+        default=["easy", "medium", "hard", "medium_hard", "hard_plus", "expert"],
+        help="Tasks to run (default: all 6)",
     )
     parser.add_argument(
         "--verbose",
@@ -895,8 +906,8 @@ def main():
     print("RESULTS SUMMARY")
     print("=" * 60)
     for task_id, result in results.items():
-        print(f"  {task_id:8s}: {result['score']:.4f} ({result['steps_taken']} steps)")
-    print(f"  {'MEAN':8s}: {mean_score:.4f}")
+        print(f"  {task_id:12s}: {result['score']:.4f} ({result['steps_taken']} steps)")
+    print(f"  {'MEAN':12s}: {mean_score:.4f}")
     print("=" * 60)
 
     # Output JSON for reproducibility

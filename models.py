@@ -44,6 +44,8 @@ class ActionType(str, Enum):
     CORRELATE_EVENTS = "correlate_events"
     INSPECT_ENDPOINT = "inspect_endpoint"
     CHECK_USER_HISTORY = "check_user_history"
+    ANALYZE_MALWARE = "analyze_malware"
+    REQUEST_FORENSIC_IMAGE = "request_forensic_image"
 
     # Response actions
     CLASSIFY_SEVERITY = "classify_severity"
@@ -73,6 +75,9 @@ class ThreatCategory(str, Enum):
     LATERAL_MOVEMENT = "lateral_movement"
     PRIVILEGE_ESCALATION = "privilege_escalation"
     FALSE_POSITIVE = "false_positive"
+    RANSOMWARE = "ransomware"
+    SUPPLY_CHAIN = "supply_chain"
+    APT_ZERO_DAY = "apt_zero_day"
 
 
 # =============================================================================

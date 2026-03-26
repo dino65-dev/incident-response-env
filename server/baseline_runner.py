@@ -5,10 +5,12 @@
 """
 Baseline runner for the Incident Response Triage Environment.
 
-Runs a deterministic baseline agent against all 3 tasks and produces
+Runs a deterministic baseline agent against all 6 tasks and produces
 reproducible scores. Can be used standalone or via the /baseline endpoint.
 """
 
+import os
+import sys
 from typing import Any, Dict, List
 
 try:
@@ -19,9 +21,13 @@ try:
         Severity,
         ThreatCategory,
     )
-    from ..scenarios import SCENARIOS
+    from ..tasks import SCENARIOS
     from .incident_response_env_environment import IncidentResponseEnvEnvironment
 except ImportError:
+    # When running from server/ directory, add parent to path
+    _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if _parent not in sys.path:
+        sys.path.insert(0, _parent)
     from models import (
         ActionType,
         ContainmentAction,
@@ -29,8 +35,11 @@ except ImportError:
         Severity,
         ThreatCategory,
     )
-    from scenarios import SCENARIOS
-    from server.incident_response_env_environment import IncidentResponseEnvEnvironment
+    from tasks import SCENARIOS
+    try:
+        from server.incident_response_env_environment import IncidentResponseEnvEnvironment
+    except ImportError:
+        from incident_response_env_environment import IncidentResponseEnvEnvironment
 
 
 def run_deterministic_baseline(task_id: str) -> Dict[str, Any]:
@@ -46,10 +55,11 @@ def run_deterministic_baseline(task_id: str) -> Dict[str, Any]:
     6. Correlate events
     7. Classify severity and category
     8. Execute containment
-    9. Submit report
+    9. Escalate if needed
+    10. Submit report
 
     Args:
-        task_id: One of "easy", "medium", "hard"
+        task_id: One of "easy", "medium", "hard", "medium_hard", "hard_plus", "expert"
 
     Returns:
         Dict with score, steps taken, and action history
@@ -109,14 +119,33 @@ def run_deterministic_baseline(task_id: str) -> Dict[str, Any]:
     actions_taken.append("classify_severity")
 
     # Step 8: Containment
-    for ca in scenario.required_containment[:2]:
-        target = scenario.containment_targets.get(ca.value, "unknown")
-        obs = env.step(IncidentAction(
-            action_type=ActionType.CONTAIN_THREAT,
-            containment_actions=[ca],
-            target=target,
-        ))
-        actions_taken.append(f"contain:{ca.value}")
+    # For scenarios with required_containment_pairs, use those
+    if scenario.required_containment_pairs:
+        executed_pairs = set()
+        for action_type, target in scenario.required_containment_pairs:
+            pair_key = (action_type, target)
+            if pair_key not in executed_pairs:
+                executed_pairs.add(pair_key)
+                try:
+                    ca = ContainmentAction(action_type)
+                except ValueError:
+                    continue
+                obs = env.step(IncidentAction(
+                    action_type=ActionType.CONTAIN_THREAT,
+                    containment_actions=[ca],
+                    target=target,
+                ))
+                actions_taken.append(f"contain:{action_type}:{target[:20]}")
+    else:
+        # Legacy containment for existing scenarios
+        for ca in scenario.required_containment[:4]:
+            target = scenario.containment_targets.get(ca.value, "unknown")
+            obs = env.step(IncidentAction(
+                action_type=ActionType.CONTAIN_THREAT,
+                containment_actions=[ca],
+                target=target,
+            ))
+            actions_taken.append(f"contain:{ca.value}")
 
     # Step 9: Escalate if needed
     if scenario.correct_escalation:
@@ -160,21 +189,22 @@ def run_deterministic_baseline(task_id: str) -> Dict[str, Any]:
 
 def run_baseline_all_tasks() -> Dict[str, Any]:
     """
-    Run baseline agent against all 3 tasks and return results.
+    Run baseline agent against all 6 tasks and return results.
 
     Returns:
         Dict with results for each task and aggregate score
     """
     results = {}
     total_score = 0.0
+    task_ids = ["easy", "medium", "hard", "medium_hard", "hard_plus", "expert"]
 
-    for task_id in ["easy", "medium", "hard"]:
+    for task_id in task_ids:
         result = run_deterministic_baseline(task_id)
         results[task_id] = result
         total_score += result["score"]
 
     results["aggregate"] = {
-        "mean_score": round(total_score / 3, 4),
+        "mean_score": round(total_score / len(task_ids), 4),
         "total_score": round(total_score, 4),
     }
 
