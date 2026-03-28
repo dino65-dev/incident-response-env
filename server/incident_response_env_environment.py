@@ -52,6 +52,12 @@ try:
     )
     from ..tasks import SCENARIOS, TASK_DEFINITIONS
     from ..tasks.base import Scenario
+    from ..self_evolving import (
+        AgentPerformanceRecord,
+        EvolutionEngine,
+        ScenarioGenerator,
+        ScenarioGenome,
+    )
 except ImportError:
     # When running from server/ directory, add parent to path
     _parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -68,6 +74,12 @@ except ImportError:
     )
     from tasks import SCENARIOS, TASK_DEFINITIONS
     from tasks.base import Scenario
+    from self_evolving import (
+        AgentPerformanceRecord,
+        EvolutionEngine,
+        ScenarioGenerator,
+        ScenarioGenome,
+    )
 
 
 class IncidentResponseEnvEnvironment(Environment):
@@ -126,6 +138,10 @@ class IncidentResponseEnvEnvironment(Environment):
         self._ti_iocs_checked: Set[str] = set()
         self._investigated_before_classify: bool = False
         self._classified_before_contain: bool = True  # starts true, set false if violated
+        # Self-evolving engine
+        self._evolution_engine: Optional[EvolutionEngine] = None
+        self._scenario_generator: Optional[ScenarioGenerator] = None
+        self._current_genome: Optional[ScenarioGenome] = None
 
     def reset(self, seed=None, episode_id=None, task_id: str = None, **kwargs) -> IncidentObservation:
         """
@@ -142,6 +158,11 @@ class IncidentResponseEnvEnvironment(Environment):
         # Determine task
         if task_id is None:
             task_id = kwargs.get("task_id", "easy")
+
+        # Self-evolving mode
+        if task_id == "evolved" or (task_id and task_id.startswith("evolved_")):
+            return self._reset_evolved(seed=seed, episode_id=episode_id)
+
         self._task_id = task_id if task_id in SCENARIOS else "easy"
 
         # Load scenario
@@ -189,6 +210,74 @@ class IncidentResponseEnvEnvironment(Environment):
             done=False,
             reward=0.0,
         )
+
+    def _reset_evolved(self, seed=None, episode_id=None) -> IncidentObservation:
+        """Reset with a procedurally generated evolved scenario."""
+        if self._evolution_engine is None:
+            self._evolution_engine = EvolutionEngine(population_size=10, alpha=0.5)
+            self._scenario_generator = ScenarioGenerator()
+
+        # Get next scenario genome from evolution engine
+        genome = self._evolution_engine.get_next_scenario_genome()
+
+        # Generate scenario from genome
+        scenario = self._scenario_generator.generate(genome, seed=seed)
+
+        # Store genome reference for performance recording
+        self._current_genome = genome
+
+        # Use standard reset logic with the generated scenario
+        self._task_id = scenario.task_id
+        self._scenario = scenario
+
+        # Reset all state (same as normal reset)
+        self._state = IncidentState(
+            episode_id=episode_id or str(uuid4()),
+            step_count=0,
+            current_task=self._task_id,
+        )
+        self._evidence_discovered = set()
+        self._iocs_discovered = set()
+        self._actions_history = []
+        self._containment_executed = []
+        self._severity_set = None
+        self._category_set = None
+        self._escalated_to = None
+        self._report_submitted = False
+        self._report_text = ""
+        self._episode_done = False
+        self._reward_this_step = 0.0
+        self._total_reward = 0.0
+        self._closed_as_fp = False
+        self._log_sources_queried = set()
+        self._ti_iocs_checked = set()
+        self._investigated_before_classify = False
+        self._classified_before_contain = True
+
+        if seed is not None:
+            random.seed(seed)
+
+        return IncidentObservation(
+            alert_id=scenario.scenario_id,
+            alert_summary=scenario.alert_summary,
+            alert_source=scenario.alert_source,
+            timestamp=scenario.alert_timestamp,
+            findings=scenario.initial_observation,
+            evidence_collected=[],
+            iocs_discovered=[],
+            action_result="[Self-Evolving Mode] Environment initialized with evolved scenario. Begin your investigation.",
+            available_actions=[at.value for at in ActionType],
+            steps_remaining=scenario.max_steps,
+            investigation_progress=0.0,
+            done=False,
+            reward=0.0,
+        )
+
+    def get_evolution_stats(self) -> Dict[str, Any]:
+        """Get statistics about the current evolution state."""
+        if self._evolution_engine is None:
+            return {"status": "not_initialized", "message": "Reset with task_id='evolved' to activate"}
+        return self._evolution_engine.get_evolution_stats()
 
     def step(self, action: IncidentAction) -> IncidentObservation:
         """
@@ -1291,29 +1380,50 @@ class IncidentResponseEnvEnvironment(Environment):
     def get_grader_score(self) -> Dict[str, Any]:
         """Return the grader score for the current/last episode."""
         final_score = self.grade()
+        scores = {
+            "investigation_completeness": round(self._calculate_investigation_completeness(), 4),
+            "ioc_identification": round(
+                len(self._iocs_discovered & self._scenario.critical_iocs) / max(len(self._scenario.critical_iocs), 1), 4
+            ) if self._scenario else 0.0,
+            "severity_correct": self._severity_set == self._scenario.true_severity if self._scenario else False,
+            "category_correct": self._category_set == self._scenario.true_category if self._scenario else False,
+            "containment_score": round(self._grade_containment(), 4),
+            "containment_precision": round(self._grade_containment_precision(), 4),
+            "report_submitted": self._report_submitted,
+            "escalation_correct": (
+                self._escalated_to in ([self._scenario.correct_escalation] if self._task_id != "expert"
+                                       else ["tier3", "management", "legal"])
+                if self._scenario and self._scenario.correct_escalation and self._escalated_to
+                else self._escalated_to is None and (not self._scenario or not self._scenario.correct_escalation)
+            ),
+            "evidence_chain_coherence": self._investigated_before_classify,
+            "phase_discipline": self._classified_before_contain,
+            "log_sources_queried": len(self._log_sources_queried),
+            "steps_used": self._state.step_count,
+            "max_steps": self._scenario.max_steps if self._scenario else 0,
+        }
+
+        # Record performance for evolution engine
+        if self._evolution_engine and self._current_genome:
+            import time
+            record = AgentPerformanceRecord(
+                scenario_id=self._scenario.scenario_id if self._scenario else "",
+                genome_id=self._current_genome.genome_id,
+                score=final_score,
+                steps_used=self._state.step_count,
+                max_steps=self._scenario.max_steps if self._scenario else 25,
+                evidence_found_ratio=scores.get("investigation_completeness", 0),
+                iocs_found_ratio=scores.get("ioc_identification", 0),
+                correct_severity=scores.get("severity_correct", False),
+                correct_category=scores.get("category_correct", False),
+                containment_score=scores.get("containment_score", 0),
+                report_quality=0.0,
+                timestamp=time.time(),
+            )
+            self._evolution_engine.record_performance(self._current_genome, record)
+
         return {
             "score": final_score,
             "task_id": self._task_id,
-            "breakdown": {
-                "investigation_completeness": round(self._calculate_investigation_completeness(), 4),
-                "ioc_identification": round(
-                    len(self._iocs_discovered & self._scenario.critical_iocs) / max(len(self._scenario.critical_iocs), 1), 4
-                ) if self._scenario else 0.0,
-                "severity_correct": self._severity_set == self._scenario.true_severity if self._scenario else False,
-                "category_correct": self._category_set == self._scenario.true_category if self._scenario else False,
-                "containment_score": round(self._grade_containment(), 4),
-                "containment_precision": round(self._grade_containment_precision(), 4),
-                "report_submitted": self._report_submitted,
-                "escalation_correct": (
-                    self._escalated_to in ([self._scenario.correct_escalation] if self._task_id != "expert"
-                                           else ["tier3", "management", "legal"])
-                    if self._scenario and self._scenario.correct_escalation and self._escalated_to
-                    else self._escalated_to is None and (not self._scenario or not self._scenario.correct_escalation)
-                ),
-                "evidence_chain_coherence": self._investigated_before_classify,
-                "phase_discipline": self._classified_before_contain,
-                "log_sources_queried": len(self._log_sources_queried),
-                "steps_used": self._state.step_count,
-                "max_steps": self._scenario.max_steps if self._scenario else 0,
-            },
+            "breakdown": scores,
         }

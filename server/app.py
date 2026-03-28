@@ -181,6 +181,27 @@ async def run_baseline():
     return JSONResponse(content=results)
 
 
+@app.post("/env/evolve")
+async def evolve_population():
+    """Trigger evolution of the scenario population."""
+    if not hasattr(_shared_env, '_evolution_engine') or _shared_env._evolution_engine is None:
+        raise HTTPException(status_code=400, detail="Evolution engine not initialized. Reset with task_id='evolved' first.")
+    new_pop = _shared_env._evolution_engine.evolve()
+    return JSONResponse(content={
+        "status": "evolved",
+        "generation": _shared_env._evolution_engine.state.generation,
+        "population_size": len(new_pop),
+    })
+
+
+@app.get("/env/evolution-stats")
+async def evolution_stats():
+    """Get evolution engine statistics."""
+    if not hasattr(_shared_env, '_evolution_engine') or _shared_env._evolution_engine is None:
+        return JSONResponse(content={"status": "not_initialized", "message": "Reset with task_id='evolved' to activate"})
+    return JSONResponse(content=_shared_env._evolution_engine.get_evolution_stats())
+
+
 def main(host: str = "0.0.0.0", port: int = 8000):
     """Entry point for direct execution."""
     import uvicorn

@@ -11,7 +11,7 @@ and produces reproducible baseline scores. It demonstrates how an AI agent
 interacts with the environment through the step/reset/state API.
 
 Supports ANY OpenAI-compatible LLM provider via the --api-base flag or
-auto-detection from environment variables.
+environment variables.
 
 Architecture:
     This agent implements a reasoning loop with state-goal reflection,
@@ -32,29 +32,21 @@ Architecture:
        in the prompt context to avoid wasting steps on duplicate actions.
 
 Usage:
-    # OpenAI (default):
+    # OpenAI (default — just set API key):
     OPENAI_API_KEY=sk-... python baseline_inference.py
 
-    # OpenRouter (auto-detected from env var):
-    OPENROUTER_API_KEY=sk-or-... python baseline_inference.py --model google/gemini-2.5-flash
+    # Any OpenAI-compatible provider (set base URL):
+    OPENAI_API_KEY=sk-or-... OPENAI_BASE_URL=https://openrouter.ai/api/v1 python baseline_inference.py --model google/gemini-2.5-flash
 
-    # Anthropic (OpenAI-compatible endpoint):
-    ANTHROPIC_API_KEY=sk-ant-... python baseline_inference.py --model claude-sonnet-4-20250514
-
-    # Any provider via explicit flags:
-    python baseline_inference.py --api-key KEY --api-base https://my-provider/v1 --model my-model
+    # Explicit flags:
+    python baseline_inference.py --api-key KEY --api-base https://provider/v1 --model my-model
 
     # Local models (Ollama, vLLM, etc.):
     python baseline_inference.py --api-base http://localhost:11434/v1 --api-key dummy --model llama3
 
-    # Run against a remote HF Space:
-    OPENAI_API_KEY=sk-... python baseline_inference.py --base-url https://huggingface.co/spaces/your-user/incident-response-env
-
-Environment Variables (checked in order):
-    LLM_API_KEY + LLM_API_BASE : Universal override for any provider
-    OPENROUTER_API_KEY          : OpenRouter (https://openrouter.ai/api/v1)
-    ANTHROPIC_API_KEY            : Anthropic (https://api.anthropic.com/v1)
-    OPENAI_API_KEY               : OpenAI (https://api.openai.com/v1) [default]
+Environment Variables:
+    OPENAI_API_KEY    : API key (required)
+    OPENAI_BASE_URL   : API base URL (optional, defaults to https://api.openai.com/v1)
 
 Output:
     Prints scores for each task and aggregate results.
@@ -752,61 +744,48 @@ def run_llm_agent(
 
 
 # =============================================================================
-# Provider Auto-Detection
+# Configuration — OpenAI-Compatible API
 # =============================================================================
-
-# Known provider configurations: (env_var_key, api_base_url, provider_name)
-PROVIDER_CONFIGS: List[Tuple[str, str, str]] = [
-    ("LLM_API_KEY",        os.environ.get("LLM_API_BASE", ""), "Custom"),
-    ("OPENROUTER_API_KEY", "https://openrouter.ai/api/v1",     "OpenRouter"),
-    ("ANTHROPIC_API_KEY",  "https://api.anthropic.com/v1",      "Anthropic"),
-    ("OPENAI_API_KEY",     "https://api.openai.com/v1",         "OpenAI"),
-]
+# Simple: provide an API key + optional base URL.
+# If only API key given → defaults to OpenAI (https://api.openai.com/v1)
+# If base URL also given → uses that provider (OpenRouter, Anthropic, local, etc.)
 
 
 def resolve_llm_config(
     cli_api_key: Optional[str] = None,
     cli_api_base: Optional[str] = None,
-) -> Tuple[str, str, str]:
+) -> Tuple[str, str]:
     """
-    Resolve LLM API key, base URL, and provider name.
+    Resolve LLM API key and base URL.
 
     Priority:
-        1. Explicit CLI flags (--api-key, --api-base)
-        2. Auto-detect from environment variables
+        1. CLI flags (--api-key, --api-base)
+        2. Environment variables (OPENAI_API_KEY + OPENAI_BASE_URL)
+
+    If only an API key is given (no base URL), defaults to https://api.openai.com/v1
 
     Returns:
-        (api_key, api_base, provider_name)
-
-    Raises:
-        SystemExit if no API key is found.
+        (api_key, api_base)
     """
-    # 1. CLI flags take highest priority
-    if cli_api_key:
-        base = cli_api_base or "https://api.openai.com/v1"
-        return cli_api_key, base, "Custom" if cli_api_base else "OpenAI"
+    # 1. CLI flags
+    api_key = cli_api_key or os.environ.get("OPENAI_API_KEY", "")
+    api_base = cli_api_base or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
-    # 2. Auto-detect from environment variables
-    for env_key, default_base, provider in PROVIDER_CONFIGS:
-        key = os.environ.get(env_key)
-        if key:
-            base = cli_api_base or default_base
-            if not base:
-                # LLM_API_KEY without LLM_API_BASE — fall back to OpenAI
-                base = "https://api.openai.com/v1"
-            return key, base, provider
+    if not api_key:
+        print("ERROR: No API key found.")
+        print()
+        print("Provide an OpenAI-compatible API key:")
+        print("  OPENAI_API_KEY=sk-...  python baseline_inference.py")
+        print()
+        print("For other providers, also set the base URL:")
+        print("  OPENAI_API_KEY=sk-or-... OPENAI_BASE_URL=https://openrouter.ai/api/v1 python baseline_inference.py")
+        print("  OPENAI_API_KEY=sk-ant-... OPENAI_BASE_URL=https://api.anthropic.com/v1 python baseline_inference.py")
+        print()
+        print("Or pass explicitly:")
+        print("  python baseline_inference.py --api-key KEY --api-base https://provider/v1")
+        sys.exit(1)
 
-    # No key found
-    print("ERROR: No LLM API key found.")
-    print()
-    print("Set one of these environment variables:")
-    print("  OPENAI_API_KEY       - for OpenAI models")
-    print("  OPENROUTER_API_KEY   - for OpenRouter (any model)")
-    print("  ANTHROPIC_API_KEY    - for Anthropic models")
-    print("  LLM_API_KEY          - for any provider (set LLM_API_BASE too)")
-    print()
-    print("Or pass explicitly: --api-key YOUR_KEY --api-base https://provider/v1")
-    sys.exit(1)
+    return api_key, api_base
 
 
 def main():
@@ -849,17 +828,17 @@ def main():
     )
     args = parser.parse_args()
 
-    # Resolve LLM provider
-    api_key, api_base, provider_name = resolve_llm_config(
+    # Resolve LLM provider (OpenAI-compatible)
+    api_key, api_base = resolve_llm_config(
         cli_api_key=args.api_key,
         cli_api_base=args.api_base,
     )
 
     client = OpenAI(api_key=api_key, base_url=api_base)
 
-    # Build extra headers for providers that need them
+    # Build extra headers for OpenRouter if detected
     extra_headers: Optional[Dict[str, str]] = None
-    if provider_name == "OpenRouter" or "openrouter.ai" in api_base:
+    if "openrouter.ai" in api_base:
         extra_headers = {
             "HTTP-Referer": "https://github.com/incident-response-env",
             "X-Title": "Incident Response Triage Environment",
@@ -867,7 +846,7 @@ def main():
 
     print("=" * 60)
     print("Incident Response Triage - Baseline Inference")
-    print(f"Provider: {provider_name} ({api_base})")
+    print(f"API: {api_base}")
     print(f"Server: {args.base_url}")
     print(f"Model: {args.model}")
     print(f"Tasks: {args.tasks}")

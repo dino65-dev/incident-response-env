@@ -37,6 +37,26 @@ The agent receives a cybersecurity alert and must:
 - **Anti-loop penalties**: Repeated identical actions receive increasing penalties, encouraging diverse investigation strategies.
 - **Phase discipline**: Agents are rewarded for following proper IR workflow (investigate before classify, classify before contain) and penalized for phase violations.
 
+### Self-Evolving Environment (Unique Feature)
+
+This environment features a **self-evolving scenario generation engine** that creates an open-ended curriculum of cybersecurity incidents:
+
+- **α-Curriculum Reward**: Automatically generates scenarios in the agent's "zone of proximal development" (target success rate ~50%)
+- **POET-inspired Evolution**: Population of scenario genomes with mutation, crossover, and fitness-proportionate selection
+- **Novelty Search**: Diversity pressure ensures the environment explores the full space of possible incidents
+- **Elo Rating System**: Both agent and scenarios are rated, providing natural difficulty calibration
+- **Procedural Generation**: 6 attack archetypes (phishing, lateral movement, insider threat, ransomware, supply chain, APT) with parameterized complexity
+
+Use `task_id="evolved"` to activate self-evolving mode:
+```python
+# Activate self-evolving mode
+obs = env.reset(task_id="evolved")
+# ... run agent ...
+# Trigger evolution based on performance
+requests.post(f"{base_url}/env/evolve")
+stats = requests.get(f"{base_url}/env/evolution-stats").json()
+```
+
 ---
 
 ## Action / Observation Space
@@ -257,35 +277,30 @@ OPENAI_API_KEY=sk-... python baseline_inference.py --verbose
 
 ### Supported LLM Providers
 
-The baseline inference script works with **any OpenAI-compatible API**. Set the appropriate environment variable or use `--api-key` / `--api-base` flags:
+The baseline inference script works with **any OpenAI-compatible API**. Just set `OPENAI_API_KEY` and optionally `OPENAI_BASE_URL`:
 
 ```bash
-# OpenAI (default)
+# OpenAI (default — just set API key)
 OPENAI_API_KEY=sk-... python baseline_inference.py --model gpt-4o-mini
 
 # OpenRouter — access 200+ models (Gemini, Claude, Llama, Mistral, etc.)
-OPENROUTER_API_KEY=sk-or-... python baseline_inference.py --model google/gemini-2.5-flash
+OPENAI_API_KEY=sk-or-... OPENAI_BASE_URL=https://openrouter.ai/api/v1 python baseline_inference.py --model google/gemini-2.5-flash
 
 # Anthropic (OpenAI-compatible endpoint)
-ANTHROPIC_API_KEY=sk-ant-... python baseline_inference.py --model claude-sonnet-4-20250514
+OPENAI_API_KEY=sk-ant-... OPENAI_BASE_URL=https://api.anthropic.com/v1 python baseline_inference.py --model claude-sonnet-4-20250514
 
 # Local models via Ollama
 python baseline_inference.py --api-base http://localhost:11434/v1 --api-key dummy --model llama3
 
-# Any OpenAI-compatible provider
+# Any OpenAI-compatible provider (explicit flags)
 python baseline_inference.py --api-key YOUR_KEY --api-base https://your-provider/v1 --model your-model
-
-# Universal override (works with any provider)
-LLM_API_KEY=... LLM_API_BASE=https://provider/v1 python baseline_inference.py --model model-name
 ```
 
-**Environment variables** (auto-detected in order):
-| Variable | Provider | API Base |
-|----------|----------|----------|
-| `LLM_API_KEY` + `LLM_API_BASE` | Any | Custom |
-| `OPENROUTER_API_KEY` | OpenRouter | `https://openrouter.ai/api/v1` |
-| `ANTHROPIC_API_KEY` | Anthropic | `https://api.anthropic.com/v1` |
-| `OPENAI_API_KEY` | OpenAI | `https://api.openai.com/v1` |
+**Environment variables:**
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | API key (required) |
+| `OPENAI_BASE_URL` | API base URL (optional, defaults to `https://api.openai.com/v1`) |
 
 ### Docker
 
@@ -326,6 +341,8 @@ openenv push
 | `/tasks` | GET | List all 6 tasks with descriptions and action schema |
 | `/grader` | GET | Get grader score after episode completion |
 | `/baseline` | POST | Run deterministic baseline on all 6 tasks |
+| `/env/evolve` | POST | Trigger evolution of the scenario population |
+| `/env/evolution-stats` | GET | Get evolution engine statistics |
 
 ### Example Interaction
 
@@ -401,6 +418,10 @@ incident-response-env/
 │   ├── task_medium_ransomware.py  # Medium-Hard: Ransomware deployment
 │   ├── task_hard_supply_chain.py  # Hard-Plus: Supply chain compromise
 │   └── task_expert_apt_zeroday.py # Expert: APT with zero-day exploitation
+├── self_evolving/                 # Self-evolving scenario generation engine
+│   ├── __init__.py                # Package exports
+│   ├── evolution_engine.py        # α-Curriculum, POET mutations, Elo ratings
+│   └── scenario_generator.py     # Procedural scenario generation from genomes
 ├── client.py                      # EnvClient implementation
 ├── openenv.yaml                   # OpenEnv configuration
 ├── pyproject.toml                 # Python project metadata
