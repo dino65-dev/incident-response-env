@@ -48,6 +48,11 @@ Environment Variables:
     OPENAI_API_KEY    : API key (required)
     OPENAI_BASE_URL   : API base URL (optional, defaults to https://api.openai.com/v1)
 
+    Hackathon-compatible (fallback):
+    API_BASE_URL      : LLM endpoint (fallback if OPENAI_BASE_URL not set)
+    HF_TOKEN / API_KEY: API key (fallback if OPENAI_API_KEY not set)
+    MODEL_NAME        : Model identifier (fallback if --model not given)
+
 Output:
     Prints scores for each task and aggregate results.
 """
@@ -761,15 +766,27 @@ def resolve_llm_config(
     Priority:
         1. CLI flags (--api-key, --api-base)
         2. Environment variables (OPENAI_API_KEY + OPENAI_BASE_URL)
+        3. Hackathon env vars (HF_TOKEN/API_KEY + API_BASE_URL)
 
     If only an API key is given (no base URL), defaults to https://api.openai.com/v1
 
     Returns:
         (api_key, api_base)
     """
-    # 1. CLI flags
-    api_key = cli_api_key or os.environ.get("OPENAI_API_KEY", "")
-    api_base = cli_api_base or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    # 1. CLI flags → 2. OPENAI_* env vars → 3. Hackathon env vars (HF_TOKEN/API_KEY, API_BASE_URL)
+    api_key = (
+        cli_api_key
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("HF_TOKEN")
+        or os.environ.get("API_KEY")
+        or ""
+    )
+    api_base = (
+        cli_api_base
+        or os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("API_BASE_URL")
+        or "https://api.openai.com/v1"
+    )
 
     if not api_key:
         print("ERROR: No API key found.")
@@ -799,8 +816,8 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default="gpt-4o-mini",
-        help="LLM model name (default: gpt-4o-mini). Use provider-specific "
+        default=os.environ.get("MODEL_NAME", "gpt-4o-mini"),
+        help="LLM model name (default: MODEL_NAME env var or gpt-4o-mini). Use provider-specific "
              "names, e.g. 'google/gemini-2.5-flash' for OpenRouter, "
              "'claude-sonnet-4-20250514' for Anthropic.",
     )

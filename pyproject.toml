@@ -26,5 +26,5 @@ server = "incident_response_env.server.app:main"
 
 [tool.setuptools]
 include-package-data = true
-packages = ["incident_response_env", "incident_response_env.server"]
+packages = ["incident_response_env", "incident_response_env.server", "self_evolving"]
 package-dir = { "incident_response_env" = ".", "incident_response_env.server" = "server" }
