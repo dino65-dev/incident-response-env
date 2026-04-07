@@ -1,3 +1,12 @@
+---
+title: Incident Response Triage
+emoji: 🛡️
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
 # Incident Response Triage Environment
 
 A real-world cybersecurity **Security Operations Center (SOC) analyst simulation** built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework. AI agents investigate security alerts, gather forensic evidence, correlate findings, classify threats, and execute incident response — exactly like human SOC analysts do every day.
