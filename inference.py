@@ -24,6 +24,12 @@ from typing import Any, Dict, List, Optional
 import requests
 
 try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not required if env vars are set externally
+
+try:
     from openai import OpenAI
 except ImportError:
     print("ERROR: openai package required. Install with: pip install openai>=1.0.0")
@@ -44,13 +50,35 @@ ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
 # Agent configuration — tuned for 20-min runtime on 2 vCPU / 8GB
 MAX_AGENT_STEPS = 30         # Max LLM calls per task
 TEMPERATURE = 0.2            # Low temperature for deterministic actions
-MAX_TOKENS = 1024            # Enough for JSON action + brief reasoning
+MAX_TOKENS = 1024           # Enough for JSON action + brief reasoning
 RATE_LIMIT_RETRIES = 3       # Retries on 429
 RATE_LIMIT_WAIT = 5          # Base wait seconds (multiplied by attempt)
-REQUEST_TIMEOUT = 30         # HTTP timeout for env API calls
+REQUEST_TIMEOUT = 1         # HTTP timeout for env API calls
 
 # Tasks to run
 ALL_TASKS = ["easy", "medium", "hard", "medium_hard", "hard_plus", "expert"]
+
+
+# =============================================================================
+# Structured Logging
+# =============================================================================
+
+def log_start(task: str, env_name: str, model: str) -> None:
+    """Emit [START] log line — once per episode."""
+    print(f"[START] task={task} env={env_name} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str] = None) -> None:
+    """Emit [STEP] log line — once per environment step."""
+    error_str = error if error else "null"
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={str(done).lower()} error={error_str}", flush=True)
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    """Emit [END] log line — once per episode (even on error)."""
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
 
 
 # =============================================================================
@@ -335,9 +363,12 @@ def run_agent_on_task(
     )
     if reset_resp.status_code != 200:
         print(f"  RESET FAILED ({reset_resp.status_code}): {reset_resp.text[:200]}")
+        log_start(task=task_id, env_name="incident_response_env", model=MODEL_NAME)
+        log_end(success=False, steps=0, score=0.0, rewards=[])
         return {"task_id": task_id, "score": 0.0, "steps_taken": 0, "actions": [], "breakdown": {}}
 
     observation = reset_resp.json().get("observation", {})
+    log_start(task=task_id, env_name="incident_response_env", model=MODEL_NAME)
 
     # Build initial prompt
     initial_prompt = (
@@ -379,6 +410,7 @@ def run_agent_on_task(
     action_counts: Dict[str, int] = {}
     log_sources_queried: set = set()
     ALL_LOG_SOURCES = ["email", "edr", "auth", "proxy", "firewall", "dns"]
+    step_rewards: List[float] = []
 
     for step_num in range(MAX_AGENT_STEPS):
         if done:
@@ -520,10 +552,17 @@ def run_agent_on_task(
             step_data = step_resp.json()
         except Exception as e:
             print(f"  Step API error: {e}")
+            step_rewards.append(0.0)
+            log_step(step=step_num + 1, action=action_key, reward=0.0, done=True, error=str(e))
             break
 
         obs = step_data.get("observation", {})
         done = step_data.get("done", False)
+        step_reward = step_data.get("reward", 0.0)
+        if not isinstance(step_reward, (int, float)):
+            step_reward = 0.0
+        step_rewards.append(step_reward)
+        log_step(step=step_num + 1, action=action_key, reward=step_reward, done=done)
 
         # Update tracking
         evidence_collected = obs.get("evidence_collected", evidence_collected)
@@ -572,9 +611,12 @@ def run_agent_on_task(
     except Exception:
         grader_data = {"score": 0.0, "breakdown": {}}
 
+    final_score = grader_data.get("score", 0.0)
+    log_end(success=done, steps=len(actions_taken), score=final_score, rewards=step_rewards)
+
     return {
         "task_id": task_id,
-        "score": grader_data.get("score", 0.0),
+        "score": final_score,
         "steps_taken": len(actions_taken),
         "actions": actions_taken,
         "breakdown": grader_data.get("breakdown", {}),

@@ -10,3 +10,4 @@ build/
 venv/
 .env
 baseline_results.json
+inference_results.json
