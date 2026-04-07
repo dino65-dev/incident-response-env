@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-# Copyright (c) 2026 - OpenEnv Hackathon Submission
 # Incident Response Triage Environment - Inference Script
-# BSD-3-Clause License
 
 """
 Inference Script for the Incident Response Triage Environment.
 
-This is the MANDATORY inference script for the Meta PyTorch OpenEnv Hackathon.
-It uses the hackathon-required environment variables and OpenAI Client.
-
-MANDATORY Environment Variables:
+Environment Variables:
     API_BASE_URL   The API endpoint for the LLM (default: https://router.huggingface.co/v1)
     MODEL_NAME     The model identifier to use for inference
     HF_TOKEN       Your Hugging Face / API key
@@ -17,8 +12,6 @@ MANDATORY Environment Variables:
 Architecture:
     LLM agent with state-goal reflection, multi-step investigation planning,
     and phase-based SOC incident response workflow (NIST SP 800-61).
-
-Runtime: < 20 minutes on 2 vCPU / 8GB RAM
 """
 
 import json
