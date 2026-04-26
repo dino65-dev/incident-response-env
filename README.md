@@ -14,6 +14,12 @@ A real-world cybersecurity **Security Operations Center (SOC) analyst simulation
 
 > **Meta PyTorch OpenEnv Hackathon 2026 — Problem Statement 1 Submission**
 
+### 🔗 Project Links
+- 🚀 **Hugging Face Space:** [https://huggingface.co/spaces/spedrox-sac/soc-marl-env](https://huggingface.co/spaces/spedrox-sac/soc-marl-env)
+- 💻 **Code Repository:** [https://github.com/dino65-dev/incident-response-env](https://github.com/dino65-dev/incident-response-env)
+- 📓 **Colab Notebook:** [Insert Colab Link Here](#)
+- 🎥 **YouTube Video / HF Blog:** [Insert Video/Blog Link Here](#)
+
 [![Hugging Face Space](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Space-blue)](https://huggingface.co/spaces/spedrox-sac/soc-marl-env)
 [![Demo Dashboard](https://img.shields.io/badge/Live%20Demo-Dashboard-success)](https://huggingface.co/spaces/spedrox-sac/soc-marl-env)
 
