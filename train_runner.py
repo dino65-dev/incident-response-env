@@ -133,7 +133,7 @@ def _train_loop(model_name, max_steps, lr, num_gen):
         # ── Reward infrastructure ──
         REQUIRED_TAGS = ["severity", "category", "iocs", "containment", "summary"]
         SEVERITY_ORDER = ["low", "medium", "high", "critical"]
-        ctde = CTDETrainer(n_agents=3, obs_dim=6, action_dim=5)
+        ctde = CTDETrainer()
         centralized_critic = ctde.critic
         curriculum = AlphaCurriculumSelector()
         reward_log = {k: [] for k in ["step", "total", "format", "evidence", "severity",
