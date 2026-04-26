@@ -291,6 +291,7 @@ def _train_loop(model_name, max_steps, lr, num_gen):
             seed=42,
             fp16=not torch.cuda.is_bf16_supported(),
             bf16=torch.cuda.is_bf16_supported(),
+            use_vllm=False,
         )
 
         trainer = GRPOTrainer(
