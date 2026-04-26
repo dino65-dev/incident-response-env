@@ -2,6 +2,9 @@
 and writes reward_log.json that the Gradio dashboard reads."""
 import json, os, sys, threading, time, re
 
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ["TORCH_COMPILE_DISABLE"] = "1"
+
 REWARD_LOG_PATH = "/tmp/reward_log_live.json"
 TRAIN_STATUS_PATH = "/tmp/train_status.json"
 
@@ -74,7 +77,7 @@ def _train_loop(model_name, max_steps, lr, num_gen):
         # ── Load model ──
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=model_name, max_seq_length=2048, load_in_4bit=True,
-            fast_inference=True, gpu_memory_utilization=0.7,
+            fast_inference=False, gpu_memory_utilization=0.7,
         )
         model = FastLanguageModel.get_peft_model(
             model, r=32, lora_alpha=64,  # Qwen3: alpha=2*rank
