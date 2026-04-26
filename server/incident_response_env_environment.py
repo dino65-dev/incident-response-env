@@ -191,6 +191,8 @@ class IncidentResponseEnvEnvironment(Environment):
         self._ti_iocs_checked = set()
         self._investigated_before_classify = False
         self._classified_before_contain = True
+        # Clear evolution engine state on non-evolved reset (Bug 7)
+        self._current_genome = None
 
         if seed is not None:
             random.seed(seed)
@@ -887,8 +889,6 @@ class IncidentResponseEnvEnvironment(Environment):
             self._reward_this_step -= 0.20
             result = "Incident closed as false positive. (WARNING: This may not be correct.)"
 
-        self._total_reward += self._reward_this_step
-
         return self._build_observation(
             findings=result,
             action_result="Incident closed.",
@@ -929,15 +929,8 @@ class IncidentResponseEnvEnvironment(Environment):
         if self._investigated_before_classify:
             self._reward_this_step += 0.03
 
-        # Correct escalation reward at report time
-        if self._scenario.correct_escalation and self._escalated_to:
-            valid_escalations = [self._scenario.correct_escalation]
-            if self._task_id == "expert":
-                valid_escalations = ["tier3", "management", "legal"]
-            if self._escalated_to in valid_escalations:
-                self._reward_this_step += 0.05
-
-        self._total_reward += self._reward_this_step
+        # Note: escalation reward is already given in _handle_escalate;
+        # not duplicated here to avoid double-counting (Bug 1 fix).
 
         return self._build_observation(
             findings=(
@@ -1058,10 +1051,12 @@ class IncidentResponseEnvEnvironment(Environment):
             score += 0.03  # Partial — did some investigation
 
         # 11. Phase discipline (5%)
-        if self._classified_before_contain:
-            score += 0.05
-        else:
-            score += 0.01  # Partial for at least containing
+        # Only award if agent actually attempted containment (Bug 6 fix)
+        if len(self._containment_executed) > 0 or self._severity_set is not None:
+            if self._classified_before_contain:
+                score += 0.05
+            else:
+                score += 0.01  # Partial for at least containing
 
         # Penalty for closing real incident as FP
         if self._closed_as_fp and not self._scenario.is_false_positive:
@@ -1075,8 +1070,6 @@ class IncidentResponseEnvEnvironment(Environment):
 
         # New pair-based grading (for new scenarios)
         if s.required_containment_pairs:
-            if not s.required_containment_pairs:
-                return 1.0 if not self._containment_executed else 0.5
 
             correct = 0
             total_required = len(s.required_containment_pairs)

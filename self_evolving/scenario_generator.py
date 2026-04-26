@@ -9,8 +9,12 @@ scenarios are both varied and solvable.
 """
 
 import hashlib
+import logging
 import random
+from string import Formatter
 from typing import Dict, List, Optional, Set, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from ..tasks.base import (
@@ -360,9 +364,65 @@ class ScenarioGenerator:
     into fully-realized Scenario objects.
     """
 
+    # Semantic keyword mapping: content patterns → evidence-compatible keywords
+    # These MUST match keywords recognized by keyword_to_evidence in the environment
+    SEMANTIC_KEYWORD_MAP = {
+        # Phishing keywords
+        "spf": ["spf", "dmarc", "dkim"],
+        "dkim": ["dkim", "spf", "dmarc"],
+        "dmarc": ["dmarc", "spf"],
+        "macro": ["macro", "vba"],
+        "powershell": ["powershell"],
+        "c2": ["c2", "c2_communication", "beacon"],
+        "beacon": ["beacon", "c2"],
+        "malware": ["dropped", "executable"],
+        "outlook": ["macro"],
+        # Lateral movement keywords
+        "brute_force": ["brute_force"],
+        "rdp": ["rdp", "lateral", "lateral_movement"],
+        "psexec": ["psexec", "lateral_movement_psexec"],
+        "mimikatz": ["credential", "ntds"],
+        "lsass": ["credential"],
+        "ntlm": ["credential"],
+        "kerberos": ["kerberos", "golden_ticket"],
+        "golden_ticket": ["golden_ticket", "kerberos"],
+        "smb": ["lateral", "lateral_movement"],
+        "wmi": ["lateral_movement"],
+        # Insider threat keywords
+        "dlp": ["dlp", "confidential"],
+        "off-hours": ["after_hours"],
+        "usb": ["anomalous", "bulk_download"],
+        "bulk": ["bulk_download", "anomalous"],
+        "upload": ["upload", "exfiltration"],
+        "exfiltrat": ["exfiltration", "data_transfer"],
+        "transfer": ["data_transfer", "volume"],
+        # Ransomware keywords
+        "encrypt": ["ransomware_encryption", "ransomware"],
+        "ransom": ["ransomware_encryption", "ransomware"],
+        "shadow cop": ["ransomware_encryption"],
+        "vssadmin": ["ransomware_encryption"],
+        "cobalt strike": ["cobalt_strike_beacon", "cobalt_strike"],
+        # Supply chain keywords
+        "backdoor": ["bf_helper_backdoor"],
+        "hash mismatch": ["buildforge"],
+        "supply chain": ["supply_chain", "buildforge"],
+        "cryptominer": ["cryptominer_deployment", "xmrig"],
+        "xmrig": ["xmrig", "cryptominer_deployment"],
+        "signing cert": ["stolen_signing_cert"],
+        "service account": ["build_svc_token_misuse", "service_token"],
+        # APT keywords
+        "dns tunnel": ["dns_tunneling_c2", "dns_tunneling"],
+        "zero-day": ["zero_day_confluence_exploit", "zero_day"],
+        "zero_day": ["zero_day_confluence_exploit", "zero_day"],
+        "confluence": ["confluence", "zero_day_confluence_exploit"],
+        "fileless": ["fileless_implant", "fileless"],
+        "dcsync": ["dcsync_credential_theft", "dcsync"],
+        "living-off-the-land": ["fileless_implant"],
+    }
+
     def __init__(self, seed: Optional[int] = None):
-        if seed is not None:
-            random.seed(seed)
+        # Bug G fix: use a LOCAL Random instance to avoid corrupting global state
+        self._rng = random.Random(seed)
 
     def generate(self, genome: ScenarioGenome, seed: Optional[int] = None) -> Scenario:
         """
@@ -375,8 +435,14 @@ class ScenarioGenerator:
         - Time pressure (max_steps vs required actions)
         - Noise level (decoy/irrelevant evidence)
         """
+        # Bug J fix: seed with genome_id hash for deterministic content per-genome
+        # This prevents Elo corruption from non-deterministic regeneration
         if seed is not None:
-            random.seed(seed)
+            self._rng = random.Random(seed)
+        else:
+            # Use genome_id as seed for reproducibility
+            genome_seed = int(hashlib.md5(genome.genome_id.encode()).hexdigest()[:8], 16)
+            self._rng = random.Random(genome_seed)
 
         # Select attack type based on difficulty
         attack_type = self._select_attack_type(genome)
@@ -387,9 +453,19 @@ class ScenarioGenerator:
 
         # Build scenario components
         severity = self._select_severity(genome, template)
-        category = random.choice(template["categories"])
+        category = self._rng.choice(template["categories"])
 
-        log_entries = self._generate_logs(genome, template, variables)
+        # Bug H fix: pre-compute max achievable critical entries to prevent
+        # declaring more than we can actually generate. Count available templates.
+        sources = ["email", "edr", "auth", "proxy", "firewall", "dns"]
+        max_possible_critical = 0
+        for source in sources:
+            if source in template["log_templates"]:
+                n_per_source = max(1, genome.num_log_entries // len(sources))
+                max_possible_critical += min(n_per_source, len(template["log_templates"][source]))
+        effective_num_critical = min(genome.num_critical_evidence, max_possible_critical)
+
+        log_entries = self._generate_logs(genome, template, variables, effective_num_critical)
         threat_intel = self._generate_threat_intel(genome, variables)
         endpoints = self._generate_endpoints(genome, variables)
         users = self._generate_users(genome, variables)
@@ -415,7 +491,7 @@ class ScenarioGenerator:
             task_id = f"evolved_expert_{genome.genome_id}"
 
         # Build alert summary
-        alert_summary = random.choice(template["alert_templates"]).format(**variables)
+        alert_summary = self._rng.choice(template["alert_templates"]).format(**variables)
 
         # Determine critical evidence and IOCs
         critical_evidence = set()
@@ -425,7 +501,8 @@ class ScenarioGenerator:
                 for kw in entry.keywords:
                     critical_evidence.add(kw)
         for ti in threat_intel:
-            critical_iocs.add(ti.ioc)
+            # Bug I fix: normalize to lowercase to prevent case mismatches
+            critical_iocs.add(ti.ioc.lower())
 
         # Build containment pairs
         containment_actions = []
@@ -482,13 +559,13 @@ class ScenarioGenerator:
 
         types = list(weights.keys())
         w = [weights[t] for t in types]
-        return random.choices(types, weights=w, k=1)[0]
+        return self._rng.choices(types, weights=w, k=1)[0]
 
     def _generate_variables(self, genome: ScenarioGenome) -> Dict[str, str]:
         """Generate random scenario variables."""
-        hostnames = random.sample(HOSTNAME_POOL, min(genome.num_endpoints + 2, len(HOSTNAME_POOL)))
-        ips = random.sample(IP_POOL, min(genome.num_endpoints + 4, len(IP_POOL)))
-        users = random.sample(USERNAME_POOL, min(genome.num_users + 2, len(USERNAME_POOL)))
+        hostnames = self._rng.sample(HOSTNAME_POOL, min(genome.num_endpoints + 2, len(HOSTNAME_POOL)))
+        ips = self._rng.sample(IP_POOL, min(genome.num_endpoints + 4, len(IP_POOL)))
+        users = self._rng.sample(USERNAME_POOL, min(genome.num_users + 2, len(USERNAME_POOL)))
 
         return {
             "hostname": hostnames[0],
@@ -496,79 +573,85 @@ class ScenarioGenerator:
             "dc_host": "SRV-DC-01",
             "user": users[0],
             "admin_user": users[1] if len(users) > 1 else "admin_ops",
-            "svc_account": f"svc_{random.choice(['deploy', 'backup', 'monitor', 'update'])}",
+            "svc_account": f"svc_{self._rng.choice(['deploy', 'backup', 'monitor', 'update'])}",
             "src_ip": ips[0],
-            "c2_ip": random.choice(IP_POOL[:10]),  # External IPs
-            "ext_ip": random.choice(IP_POOL[:10]),
-            "attacker_ip": random.choice(IP_POOL[:10]),
-            "exfil_ip": random.choice(IP_POOL[:10]),
-            "staging_ip": random.choice(IP_POOL[:10]),
-            "c2_domain": random.choice(DOMAIN_POOL),
-            "staging_domain": random.choice(DOMAIN_POOL),
-            "attacker_domain": random.choice(DOMAIN_POOL),
-            "c2_port": str(random.choice([443, 8443, 4444, 9090, 8080])),
-            "port": str(random.choice([443, 445, 3389, 22, 8080])),
-            "file_hash": random.choice(HASH_POOL),
-            "filename": random.choice(FILENAMES),
-            "file_name": random.choice(FILENAMES),
-            "proc_name": random.choice(["svchost.exe", "rundll32.exe", "powershell.exe", "cmd.exe"]),
-            "child_proc": random.choice(["cmd.exe", "powershell.exe", "certutil.exe"]),
-            "target_proc": random.choice(["explorer.exe", "lsass.exe", "svchost.exe"]),
-            "tool_name": random.choice(["Cobalt Strike", "Mimikatz", "BloodHound", "PsExec"]),
-            "pid": str(random.randint(1000, 65535)),
-            "interval": str(random.choice([30, 60, 120, 300])),
-            "attempts": str(random.randint(5, 500)),
-            "failed_count": str(random.randint(3, 20)),
-            "window": str(random.choice([5, 10, 15, 30])),
-            "data_size": str(round(random.uniform(0.5, 500), 1)),
-            "total_size": str(round(random.uniform(10, 1000), 1)),
-            "bytes": str(random.randint(1024, 10485760)),
+            "c2_ip": self._rng.choice(IP_POOL[:10]),  # External IPs
+            "ext_ip": self._rng.choice(IP_POOL[:10]),
+            "attacker_ip": self._rng.choice(IP_POOL[:10]),
+            "exfil_ip": self._rng.choice(IP_POOL[:10]),
+            "staging_ip": self._rng.choice(IP_POOL[:10]),
+            "c2_domain": self._rng.choice(DOMAIN_POOL),
+            "staging_domain": self._rng.choice(DOMAIN_POOL),
+            "attacker_domain": self._rng.choice(DOMAIN_POOL),
+            "c2_port": str(self._rng.choice([443, 8443, 4444, 9090, 8080])),
+            "port": str(self._rng.choice([443, 445, 3389, 22, 8080])),
+            "file_hash": self._rng.choice(HASH_POOL),
+            "filename": self._rng.choice(FILENAMES),
+            "file_name": self._rng.choice(FILENAMES),
+            "proc_name": self._rng.choice(["svchost.exe", "rundll32.exe", "powershell.exe", "cmd.exe"]),
+            "child_proc": self._rng.choice(["cmd.exe", "powershell.exe", "certutil.exe"]),
+            "target_proc": self._rng.choice(["explorer.exe", "lsass.exe", "svchost.exe"]),
+            "tool_name": self._rng.choice(["Cobalt Strike", "Mimikatz", "BloodHound", "PsExec"]),
+            "pid": str(self._rng.randint(1000, 65535)),
+            "interval": str(self._rng.choice([30, 60, 120, 300])),
+            "attempts": str(self._rng.randint(5, 500)),
+            "failed_count": str(self._rng.randint(3, 20)),
+            "window": str(self._rng.choice([5, 10, 15, 30])),
+            "data_size": str(round(self._rng.uniform(0.5, 500), 1)),
+            "total_size": str(round(self._rng.uniform(10, 1000), 1)),
+            "bytes": str(self._rng.randint(1024, 10485760)),
             "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-            "timestamp": "2026-03-28T" + f"{random.randint(0,23):02d}:{random.randint(0,59):02d}:00Z",
-            "subject": random.choice([
+            "timestamp": "2026-03-28T" + f"{self._rng.randint(0,23):02d}:{self._rng.randint(0,59):02d}:00Z",
+            "subject": self._rng.choice([
                 "Urgent: Invoice Payment Required",
                 "Action Required: Account Verification",
                 "Q4 Financial Report - Confidential",
                 "Password Reset Request",
                 "IT Security Update - Please Install",
             ]),
-            "attacker_email": f"attacker_{random.randint(100,999)}@{random.choice(DOMAIN_POOL)}",
-            "ext_email": f"external_{random.randint(100,999)}@gmail.com",
-            "vendor_email": f"updates@vendor-{random.randint(1,99)}.com",
-            "device_name": random.choice(["USB_Drive_SanDisk", "External_HDD_WD", "USB_Kingston_128GB"]),
-            "cloud_service": random.choice(["Dropbox", "Google Drive", "OneDrive", "Mega.nz"]),
-            "cloud_service_domain": random.choice(["dropbox.com", "drive.google.com", "onedrive.live.com"]),
-            "group_name": random.choice(["Domain Admins", "Backup Operators", "Enterprise Admins"]),
-            "geo_location": random.choice(["Moscow, RU", "Beijing, CN", "Unknown VPN", "São Paulo, BR"]),
-            "software_name": random.choice(["SolarUpdate", "NetMonitor Pro", "CloudSync Agent", "DevPipeline"]),
-            "library_name": random.choice(["node-ipc", "ua-parser-js", "event-stream", "coa"]),
-            "version": f"v{random.randint(1,5)}.{random.randint(0,9)}.{random.randint(0,99)}",
-            "install_path": random.choice(["C:\\Program Files\\", "C:\\Windows\\System32\\", "/opt/", "/usr/local/bin/"]),
-            "exploit_name": random.choice(["CVE-2026-XXXX", "Log4Shell-variant", "ProxyNotShell", "ZeroLogon-v2"]),
-            "malware_name": random.choice(["LockBit 4.0", "BlackCat v3", "REvil-NG", "DarkSide-X"]),
-            "extension": random.choice(["locked", "encrypted", "crypt", "ransom"]),
+            "attacker_email": f"attacker_{self._rng.randint(100,999)}@{self._rng.choice(DOMAIN_POOL)}",
+            "ext_email": f"external_{self._rng.randint(100,999)}@gmail.com",
+            "vendor_email": f"updates@vendor-{self._rng.randint(1,99)}.com",
+            "device_name": self._rng.choice(["USB_Drive_SanDisk", "External_HDD_WD", "USB_Kingston_128GB"]),
+            "cloud_service": self._rng.choice(["Dropbox", "Google Drive", "OneDrive", "Mega.nz"]),
+            "cloud_service_domain": self._rng.choice(["dropbox.com", "drive.google.com", "onedrive.live.com"]),
+            "group_name": self._rng.choice(["Domain Admins", "Backup Operators", "Enterprise Admins"]),
+            "geo_location": self._rng.choice(["Moscow, RU", "Beijing, CN", "Unknown VPN", "São Paulo, BR"]),
+            "software_name": self._rng.choice(["SolarUpdate", "NetMonitor Pro", "CloudSync Agent", "DevPipeline"]),
+            "library_name": self._rng.choice(["node-ipc", "ua-parser-js", "event-stream", "coa"]),
+            "version": f"v{self._rng.randint(1,5)}.{self._rng.randint(0,9)}.{self._rng.randint(0,99)}",
+            "install_path": self._rng.choice(["C:\\Program Files\\", "C:\\Windows\\System32\\", "/opt/", "/usr/local/bin/"]),
+            "exploit_name": self._rng.choice(["CVE-2026-XXXX", "Log4Shell-variant", "ProxyNotShell", "ZeroLogon-v2"]),
+            "malware_name": self._rng.choice(["LockBit 4.0", "BlackCat v3", "REvil-NG", "DarkSide-X"]),
+            "extension": self._rng.choice(["locked", "encrypted", "crypt", "ransom"]),
             "ransom_file": "README_DECRYPT.txt",
-            "ransom_domain": f"ransom-{random.randint(1000,9999)}",
-            "directory": random.choice(["C:\\Users\\", "D:\\Shares\\Finance\\", "C:\\Data\\", "/home/"]),
-            "file_count": str(random.randint(100, 50000)),
-            "attachment_count": str(random.randint(1, 10)),
-            "auth_method": random.choice(["RDP", "SMB", "WinRM", "NTLM"]),
-            "ticket_type": random.choice(["TGT", "TGS", "golden_ticket"]),
-            "command": random.choice(["whoami", "net user /domain", "ipconfig /all", "systeminfo"]),
-            "connection_count": str(random.randint(20, 200)),
-            "query_count": str(random.randint(50, 5000)),
-            "ip_count": str(random.randint(5, 50)),
-            "technique": random.choice(["token impersonation", "DLL hijacking", "service account abuse"]),
-            "domain": random.choice(DOMAIN_POOL),
-            "subdomain": f"{''.join(random.choices('abcdef0123456789', k=32))}",
+            "ransom_domain": f"ransom-{self._rng.randint(1000,9999)}",
+            "directory": self._rng.choice(["C:\\Users\\", "D:\\Shares\\Finance\\", "C:\\Data\\", "/home/"]),
+            "file_count": str(self._rng.randint(100, 50000)),
+            "attachment_count": str(self._rng.randint(1, 10)),
+            "auth_method": self._rng.choice(["RDP", "SMB", "WinRM", "NTLM"]),
+            "ticket_type": self._rng.choice(["TGT", "TGS", "golden_ticket"]),
+            "command": self._rng.choice(["whoami", "net user /domain", "ipconfig /all", "systeminfo"]),
+            "connection_count": str(self._rng.randint(20, 200)),
+            "query_count": str(self._rng.randint(50, 5000)),
+            "ip_count": str(self._rng.randint(5, 50)),
+            "technique": self._rng.choice(["token impersonation", "DLL hijacking", "service account abuse"]),
+            "domain": self._rng.choice(DOMAIN_POOL),
+            "subdomain": f"{''.join(self._rng.choices('abcdef0123456789', k=32))}",
         }
 
     def _generate_logs(
-        self, genome: ScenarioGenome, template: Dict, variables: Dict
+        self, genome: ScenarioGenome, template: Dict, variables: Dict,
+        num_critical: Optional[int] = None,
     ) -> List[LogEntry]:
         """Generate log entries with appropriate noise and critical evidence."""
         entries = []
+        critical_entries = []
+        non_critical_entries = []
         sources = ["email", "edr", "auth", "proxy", "firewall", "dns"]
+
+        # Bug H: use clamped critical count
+        target_critical = num_critical if num_critical is not None else genome.num_critical_evidence
 
         # Generate critical entries from template
         critical_count = 0
@@ -582,35 +665,57 @@ class ScenarioGenerator:
 
             for i in range(min(n, len(source_templates))):
                 tmpl = source_templates[i % len(source_templates)]
-                try:
-                    content = tmpl.format(**variables)
-                except (KeyError, IndexError):
-                    content = tmpl  # Use raw if format fails
+                # Bug P fix: safe format with missing-var handling
+                content = self._safe_format(tmpl, variables)
 
-                is_crit = critical_count < genome.num_critical_evidence
+                is_crit = critical_count < target_critical
                 keywords = self._extract_keywords(content, variables)
 
-                entries.append(LogEntry(
+                entry = LogEntry(
                     source=source,
                     content=content,
                     is_critical=is_crit,
                     keywords=keywords,
-                ))
+                )
                 if is_crit:
+                    critical_entries.append(entry)
                     critical_count += 1
+                else:
+                    non_critical_entries.append(entry)
 
-        # Add noise entries (decoys)
-        noise_count = int(len(entries) * genome.noise_ratio)
+        # Bug M fix: base noise count on num_log_entries (genome param)
+        # not on len(entries) which couples noise to critical count
+        noise_count = int(genome.num_log_entries * genome.noise_ratio)
         for _ in range(noise_count):
-            source = random.choice(sources)
-            entries.append(LogEntry(
+            source = self._rng.choice(sources)
+            non_critical_entries.append(LogEntry(
                 source=source,
-                content=f"[BENIGN] Routine {source} activity - {random.choice(['scan', 'update', 'backup', 'maintenance'])} completed successfully",
+                content=f"[BENIGN] Routine {source} activity - {self._rng.choice(['scan', 'update', 'backup', 'maintenance'])} completed successfully",
                 is_critical=False,
                 keywords=["benign", "routine"],
             ))
 
-        random.shuffle(entries)
+        # Bug L fix: use evidence_obscurity to position critical entries
+        # High obscurity = critical entries buried deep, low = early
+        self._rng.shuffle(non_critical_entries)
+        self._rng.shuffle(critical_entries)
+        total_non_crit = len(non_critical_entries)
+
+        if total_non_crit == 0 or not critical_entries:
+            # Degenerate case: just concatenate
+            entries = critical_entries + non_critical_entries
+        else:
+            entries = list(non_critical_entries)  # Start with non-critical
+            # evidence_obscurity 0.0 = insert at front, 1.0 = insert at end
+            obscurity = genome.evidence_obscurity
+            for idx, crit_entry in enumerate(critical_entries):
+                # Distribute critical entries around the obscurity position
+                base_pos = int(obscurity * len(entries))
+                # Add small jitter so they're not all at the same index
+                jitter = self._rng.randint(-1, 1)
+                insert_pos = max(0, min(len(entries), base_pos + jitter))
+                entries.insert(insert_pos, crit_entry)
+
         return entries
 
     def _generate_threat_intel(
@@ -633,7 +738,7 @@ class ScenarioGenerator:
                     ioc_type=ioc_type,
                     description=f"{desc} associated with current campaign",
                     severity=sev,
-                    source=random.choice(["VirusTotal", "AlienVault OTX", "IBM X-Force", "Mandiant"]),
+                    source=self._rng.choice(["VirusTotal", "AlienVault OTX", "IBM X-Force", "Mandiant"]),
                     keywords=[ioc.lower(), ioc_type],
                 ))
 
@@ -645,14 +750,14 @@ class ScenarioGenerator:
         """Generate endpoint information."""
         endpoints = []
         hostnames = [variables.get("hostname", "WS-01"), variables.get("target_host", "SRV-01")]
-        hostnames.extend(random.sample(HOSTNAME_POOL, min(genome.num_endpoints, len(HOSTNAME_POOL))))
+        hostnames.extend(self._rng.sample(HOSTNAME_POOL, min(genome.num_endpoints, len(HOSTNAME_POOL))))
 
         for i, host in enumerate(hostnames[:genome.num_endpoints]):
             ip = variables.get("src_ip", "10.0.0.1") if i == 0 else f"10.50.25.{100+i}"
             endpoints.append(EndpointInfo(
                 endpoint_id=host,
                 hostname=host,
-                os=random.choice(["Windows Server 2022", "Windows 11 Pro", "Ubuntu 22.04"]),
+                os=self._rng.choice(["Windows Server 2022", "Windows 11 Pro", "Ubuntu 22.04"]),
                 ip=ip,
                 status="compromised" if i < 2 else "active",
                 processes=[variables.get("proc_name", "svchost.exe")] if i < 2 else [],
@@ -670,15 +775,15 @@ class ScenarioGenerator:
         usernames = [variables.get("user", "jsmith")]
         if genome.num_users > 1:
             usernames.append(variables.get("admin_user", "admin"))
-        usernames.extend(random.sample(USERNAME_POOL, min(genome.num_users, len(USERNAME_POOL))))
+        usernames.extend(self._rng.sample(USERNAME_POOL, min(genome.num_users, len(USERNAME_POOL))))
 
         for i, uid in enumerate(usernames[:genome.num_users]):
             users.append(UserProfile(
                 user_id=uid,
                 display_name=uid.replace("_", " ").title(),
-                department=random.choice(["IT", "Finance", "Engineering", "Operations", "HR"]),
-                role=random.choice(["Analyst", "Engineer", "Manager", "Admin", "Developer"]),
-                risk_score=0.8 if i == 0 else random.uniform(0.1, 0.5),
+                department=self._rng.choice(["IT", "Finance", "Engineering", "Operations", "HR"]),
+                role=self._rng.choice(["Analyst", "Engineer", "Manager", "Admin", "Developer"]),
+                risk_score=0.8 if i == 0 else self._rng.uniform(0.1, 0.5),
                 notes="Primary suspect" if i == 0 else "",
             ))
 
@@ -723,18 +828,82 @@ class ScenarioGenerator:
         return containment
 
     def _select_severity(self, genome: ScenarioGenome, template: Dict) -> Severity:
-        """Select severity based on genome difficulty."""
-        if genome.aggregate_difficulty > 0.6:
-            return Severity.CRITICAL
-        else:
-            return random.choice(template["severities"])
+        """
+        Select severity based on difficulty AND template.
+
+        Bug K/R fix: previously forced CRITICAL for diff>0.6 regardless of
+        template, teaching agents 'hard = CRITICAL' as a shortcut.
+        Now uses template's severity range with difficulty-weighted probability.
+        """
+        severities = template["severities"]
+        if len(severities) == 1:
+            return severities[0]
+
+        diff = genome.aggregate_difficulty
+        # Weight toward higher severity as difficulty increases
+        # but never force — the agent must learn from evidence
+        severity_order = [Severity.LOW, Severity.MEDIUM, Severity.HIGH, Severity.CRITICAL]
+        available = [s for s in severity_order if s in severities]
+        if not available:
+            return self._rng.choice(severities)
+
+        # Higher diff = bias toward the last (most severe) option
+        weights = []
+        for i, s in enumerate(available):
+            # Exponential weight toward severe end based on difficulty
+            w = (1.0 - diff) if i == 0 else diff ** (i / max(1, len(available) - 1))
+            weights.append(max(0.05, w))  # Floor so nothing has zero weight
+
+        return self._rng.choices(available, weights=weights, k=1)[0]
+
+    @staticmethod
+    def _safe_format(template_str: str, variables: Dict) -> str:
+        """
+        Bug P fix: Safe string format that replaces missing keys with '?'
+        instead of silently returning the raw template string.
+        """
+        try:
+            return template_str.format(**variables)
+        except (KeyError, IndexError) as e:
+            # Fall back to partial format — replace known keys, leave unknown as '?'
+            logger.warning(f"Template format partial failure: {e} in '{template_str[:60]}...'")
+            result = template_str
+            for key, val in variables.items():
+                result = result.replace(f"{{{key}}}", str(val))
+            # Replace any remaining {xxx} with ?
+            import re
+            result = re.sub(r'\{[^}]+\}', '?', result)
+            return result
 
     def _extract_keywords(self, content: str, variables: Dict) -> List[str]:
-        """Extract searchable keywords from log content."""
+        """
+        Extract SEMANTIC keywords from log content that are compatible
+        with keyword_to_evidence in the environment.
+
+        Bug F fix: previous version returned variable VALUES (IPs, hostnames)
+        which never matched any keyword_to_evidence entry, making evolved
+        scenarios impossible to solve.
+        """
         keywords = []
-        for key in ["hostname", "target_host", "user", "c2_ip", "file_hash",
-                     "c2_domain", "src_ip", "attacker_email", "proc_name", "filename"]:
+        content_lower = content.lower()
+
+        # Match semantic patterns → evidence-compatible keywords
+        for pattern, kws in self.SEMANTIC_KEYWORD_MAP.items():
+            if pattern in content_lower:
+                keywords.extend(kws)
+
+        # Also include variable values for IOC matching (secondary)
+        for key in ["c2_ip", "file_hash", "c2_domain", "src_ip",
+                     "attacker_email", "hostname", "target_host"]:
             val = variables.get(key, "")
-            if val and val.lower() in content.lower():
+            if val and val.lower() in content_lower:
                 keywords.append(val.lower())
-        return keywords
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique_kws = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique_kws.append(kw)
+        return unique_kws

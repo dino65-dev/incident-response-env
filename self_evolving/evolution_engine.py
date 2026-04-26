@@ -22,6 +22,8 @@ import hashlib
 import json
 import math
 import random
+import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -80,8 +82,10 @@ class ScenarioGenome:
 
     def __post_init__(self):
         if not self.genome_id:
+            # Include random salt to prevent cross-session collisions (Bug E fix)
+            salt = uuid.uuid4().hex[:8]
             self.genome_id = hashlib.md5(
-                json.dumps(self.__dict__, default=str).encode()
+                f"{salt}_{json.dumps(self.__dict__, default=str)}".encode()
             ).hexdigest()[:12]
 
     @property
@@ -192,9 +196,9 @@ class MutationOperator:
         if random.random() < 0.15 * sigma:
             child.multi_stage_attack = not child.multi_stage_attack
 
-        # Regenerate ID
+        # Regenerate ID with uuid salt to prevent collisions (Bug Q fix)
         child.genome_id = hashlib.md5(
-            json.dumps(child.__dict__, default=str).encode()
+            f"{uuid.uuid4().hex[:8]}_{json.dumps(child.__dict__, default=str)}".encode()
         ).hexdigest()[:12]
 
         return child
@@ -216,7 +220,7 @@ class MutationOperator:
             child.multi_stage_attack = parent_b.multi_stage_attack
 
         child.genome_id = hashlib.md5(
-            json.dumps(child.__dict__, default=str).encode()
+            f"{uuid.uuid4().hex[:8]}_{json.dumps(child.__dict__, default=str)}".encode()
         ).hexdigest()[:12]
         return child
 
@@ -304,9 +308,15 @@ class FitnessEvaluator:
         gv = genome.difficulty_vector
         distances = []
         for other in archive:
+            # Bug B fix: exclude self from distance computation
+            if other.genome_id == genome.genome_id:
+                continue
             ov = other.difficulty_vector
             dist = math.sqrt(sum((a - b) ** 2 for a, b in zip(gv, ov)))
             distances.append(dist)
+
+        if not distances:
+            return 1.0  # Only self in archive → max novelty
 
         distances.sort()
         k = min(self.k_nearest, len(distances))
@@ -417,18 +427,30 @@ class EvolutionEngine:
                           containment_complexity=0.85, time_pressure=0.7),
         ]
 
-        # Fill population by mutating templates
+        # Bug O fix: always include all 4 template seeds first, then fill with mutations
+        # This ensures the archive can discover all difficulty levels even with small populations
         self.state.population = []
-        for i in range(self.population_size):
-            template = templates[i % len(templates)]
-            if i < len(templates):
-                genome = copy.deepcopy(template)
-            else:
-                genome = MutationOperator.mutate(template, sigma=0.3)
+
+        # Seed with all templates first (guaranteed diversity)
+        for i, template in enumerate(templates):
+            genome = copy.deepcopy(template)
             genome.genome_id = hashlib.md5(
-                f"init_{i}_{json.dumps(genome.__dict__, default=str)}".encode()
+                f"init_{i}_{uuid.uuid4().hex[:8]}_{json.dumps(genome.__dict__, default=str)}".encode()
             ).hexdigest()[:12]
             self.state.population.append(genome)
+
+        # Fill remaining slots with mutations of templates
+        while len(self.state.population) < self.population_size:
+            i = len(self.state.population)
+            template = templates[i % len(templates)]
+            genome = MutationOperator.mutate(template, sigma=0.3)
+            genome.genome_id = hashlib.md5(
+                f"init_{i}_{uuid.uuid4().hex[:8]}_{json.dumps(genome.__dict__, default=str)}".encode()
+            ).hexdigest()[:12]
+            self.state.population.append(genome)
+
+        # If population_size < 4, trim back to requested size
+        self.state.population = self.state.population[:max(self.population_size, len(templates))]
 
     def get_next_scenario_genome(self) -> ScenarioGenome:
         """
@@ -464,9 +486,17 @@ class EvolutionEngine:
         # Update Elo ratings
         self._update_elo(genome, record)
 
-        # Keep history bounded
+        # Keep history bounded, but preserve records for elite genomes
+        # so their fitness scores don't go stale (NEW-3 fix)
         if len(self.state.performance_history) > 500:
-            self.state.performance_history = self.state.performance_history[-300:]
+            # Identify elite genome IDs
+            elite_ids = {g.genome_id for g in self.state.population[:max(1, len(self.state.population) // 5)]}
+            elite_ids.update(g.genome_id for g in self.state.archive[-10:])
+            # Keep recent + any records for elite genomes
+            recent = self.state.performance_history[-300:]
+            old = self.state.performance_history[:-300]
+            elite_old = [r for r in old if r.genome_id in elite_ids]
+            self.state.performance_history = elite_old + recent
 
     def evolve(self) -> List[ScenarioGenome]:
         """
@@ -496,28 +526,34 @@ class EvolutionEngine:
 
         # Add best to archive
         for genome, fitness in scored[:2]:
+            new_entry = copy.deepcopy(genome)
             if len(self.state.archive) < self.archive_size:
-                self.state.archive.append(copy.deepcopy(genome))
+                self.state.archive.append(new_entry)
             elif fitness > 0:  # Only archive reasonably fit scenarios
-                # Replace least novel archive member
-                self.state.archive.append(copy.deepcopy(genome))
-                if len(self.state.archive) > self.archive_size:
-                    # Remove least novel
-                    novelties = [
-                        self.fitness_evaluator._compute_novelty(g, self.state.archive)
-                        for g in self.state.archive
-                    ]
-                    min_idx = novelties.index(min(novelties))
-                    self.state.archive.pop(min_idx)
+                # Replace least novel EXISTING member (excluding just-inserted)
+                # NEW-2 fix: compute novelty on archive BEFORE inserting,
+                # so the new genome can't evict itself.
+                novelties = [
+                    self.fitness_evaluator._compute_novelty(g, self.state.archive)
+                    for g in self.state.archive
+                ]
+                min_idx = novelties.index(min(novelties))
+                self.state.archive[min_idx] = new_entry
 
-        # Adaptive mutation strength
-        # If scenarios are too easy (high avg score), increase σ to find harder ones
-        # If too hard (low avg score), decrease σ to fine-tune
+        # Adaptive mutation strength (NEW-4 fix: directional, not symmetric)
+        # If scenarios are too easy (high avg score) → increase σ to explore harder
+        # If scenarios are too hard (low avg score) → DECREASE σ to fine-tune easier
         recent_scores = [r.score for r in self.state.performance_history[-20:]]
         if recent_scores:
             avg_score = sum(recent_scores) / len(recent_scores)
-            # σ peaks when avg_score is far from α
-            sigma = self.mutation_sigma * (1.0 + abs(avg_score - self.fitness_evaluator.alpha))
+            alpha = self.fitness_evaluator.alpha
+            gap = avg_score - alpha  # positive = too easy, negative = too hard
+            if gap > 0:
+                # Too easy: increase sigma to explore harder scenarios
+                sigma = self.mutation_sigma * (1.0 + gap)
+            else:
+                # Too hard: decrease sigma to fine-tune toward easier
+                sigma = self.mutation_sigma * max(0.3, 1.0 + gap)  # floor at 0.3×base
         else:
             sigma = self.mutation_sigma
 
@@ -565,6 +601,14 @@ class EvolutionEngine:
 
         self.state.agent_elo = agent_elo + K * (sa - ea)
         self.state.scenario_elos[genome.genome_id] = scenario_elo + K * (ss - es)
+
+        # Bug D fix: prune elos for genomes no longer in population or archive
+        if len(self.state.scenario_elos) > self.archive_size + self.population_size + 20:
+            active_ids = {g.genome_id for g in self.state.population}
+            active_ids.update(g.genome_id for g in self.state.archive)
+            stale_ids = [gid for gid in self.state.scenario_elos if gid not in active_ids]
+            for gid in stale_ids:
+                del self.state.scenario_elos[gid]
 
     def get_evolution_stats(self) -> Dict[str, Any]:
         """Get statistics about the current evolution state."""

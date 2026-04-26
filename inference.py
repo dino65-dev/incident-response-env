@@ -35,6 +35,19 @@ except ImportError:
     print("ERROR: openai package required. Install with: pip install openai>=1.0.0")
     sys.exit(1)
 
+# Multi-agent imports (graceful fallback)
+try:
+    from multi_agent.agents import L1TriageAgent, L2SeniorAnalyst, L3IRLead
+    from multi_agent.overseer import OverseerAgent
+    from multi_agent.communication import SharedInvestigationBoard, CommunicationReward, Message
+    from multi_agent.knowledge_graph import AgentMemoryGraph
+    from red_team.agent import RedTeamAgent, RedTeamAction, RedTeamActionType
+    from red_team.strategies import get_random_strategy
+    from training.hmarl import HierarchicalPolicy, DEFAULT_SOC_SKILLS
+    MULTI_AGENT_ENABLED = True
+except ImportError:
+    MULTI_AGENT_ENABLED = False
+
 
 # =============================================================================
 # Hackathon-Mandated Configuration
@@ -57,6 +70,13 @@ REQUEST_TIMEOUT = 1         # HTTP timeout for env API calls
 
 # Tasks to run
 ALL_TASKS = ["easy", "medium", "hard", "medium_hard", "hard_plus", "expert"]
+
+# Multi-agent mode
+MULTI_AGENT_MODE = os.getenv("MULTI_AGENT", "true").lower() == "true"
+
+# Global trajectory store for EUREKA feedback loop
+_trajectory_store: List[Dict[str, Any]] = []
+_grader_score_store: List[float] = []
 
 
 # =============================================================================
@@ -344,6 +364,165 @@ def build_state_summary(
 # Agent Loop
 # =============================================================================
 
+def _init_multi_agent_for_task() -> Dict[str, Any]:
+    """Initialize multi-agent infrastructure for a task episode."""
+    if not MULTI_AGENT_ENABLED or not MULTI_AGENT_ENABLED:
+        return {}
+
+    agents = {
+        "l1_triage": L1TriageAgent(),
+        "l2_senior": L2SeniorAnalyst(),
+        "l3_lead": L3IRLead(),
+    }
+    overseer = OverseerAgent()
+    red_team = RedTeamAgent(strategy=get_random_strategy())
+    board = SharedInvestigationBoard()
+
+    for agent in agents.values():
+        agent.reset(partner_ids=list(agents.keys()))
+    overseer.reset()
+    red_team.reset()
+    board.reset()
+
+    return {
+        "agents": agents,
+        "overseer": overseer,
+        "red_team": red_team,
+        "board": board,
+    }
+
+
+def _multi_agent_step_context(
+    ma: Dict[str, Any],
+    action: Dict[str, Any],
+    step: int,
+    observation: Dict[str, Any],
+) -> str:
+    """
+    Run multi-agent subsystems for one step and return context to inject.
+
+    This is where all systems connect:
+    - SOC agents update their KGs from observation
+    - Red team acts adversarially
+    - Overseer monitors for violations
+    - KG stats feed into EUREKA trajectory data
+    - Communication between agents
+    """
+    if not ma:
+        return ""
+
+    agents = ma["agents"]
+    overseer = ma["overseer"]
+    red_team = ma["red_team"]
+    board = ma["board"]
+
+    context_parts = []
+
+    # 1. Update SOC agent KGs from observation
+    for agent in agents.values():
+        agent.process_observation(observation, step)
+
+    # 2. Red Team adversarial step (interleaved)
+    defender_state = {
+        "log_sources_queried": list(observation.get("log_sources_queried", [])),
+        "containment_score": 0.0,
+        "severity_set": observation.get("severity_set", False),
+        "steps_remaining": observation.get("steps_remaining", 20),
+    }
+    scenario_evidence = observation.get("evidence_collected", [])
+
+    if red_team.strategy:
+        rt_action = red_team.strategy.select_action(
+            red_team.state, defender_state, step, 25
+        )
+    else:
+        rt_action = RedTeamAction(action_type=RedTeamActionType.WAIT)
+
+    rt_result = red_team.step(rt_action, defender_state, scenario_evidence)
+
+    # Red team reward visible in context
+    context_parts.append(
+        f"[RED TEAM] Action: {rt_action.action_type.value} | "
+        f"Reward: {rt_result['reward']:+.3f} | "
+        f"Detected: {rt_result['detected']} | "
+        f"Total: {rt_result['red_team_state']['total_reward']:+.3f}"
+    )
+
+    if rt_result["detected"]:
+        board.add_red_team_alert({
+            "action": rt_action.action_type.value,
+            "step": step,
+        })
+        context_parts.append("  ⚠ RED TEAM ACTIVITY DETECTED — verify evidence integrity")
+
+    # 3. Overseer monitors action
+    violation = overseer.monitor_action(
+        agent_id="primary",
+        action=action.get("action_type", ""),
+        action_params=action,
+        step=step,
+        board=board,
+    )
+    if violation:
+        context_parts.append(
+            f"[OVERSEER] ⚠ {violation.violation_type}: {violation.description} "
+            f"→ {violation.corrective_action}"
+        )
+
+    # 4. Inter-agent communication (L1 → L2 → L3)
+    l1 = agents["l1_triage"]
+    l2 = agents["l2_senior"]
+    l3 = agents["l3_lead"]
+
+    if l1.should_escalate_to_l2():
+        msg = l1.prepare_message("l2_senior", "handoff", step)
+        board.send_message(msg)
+        l2.receive_messages([msg], board)
+        board.record_handoff("l1_triage", "l2_senior", "evidence warrants deeper analysis", step)
+        context_parts.append("[ToM] L1→L2 handoff: evidence warrants deeper analysis")
+
+    if l2.should_escalate_to_l3():
+        msg = l2.prepare_message("l3_lead", "handoff", step)
+        board.send_message(msg)
+        l3.receive_messages([msg], board)
+        board.record_handoff("l2_senior", "l3_lead", "critical findings require IR Lead", step)
+        context_parts.append("[ToM] L2→L3 handoff: critical findings require IR Lead")
+
+    # 5. ToM alignment context
+    tom_context = l3.get_system_prompt_context()
+    if tom_context.strip():
+        context_parts.append(tom_context.strip())
+
+    # 6. KG evidence chain for report enrichment
+    if action.get("action_type") == "submit_report":
+        report_enrichment = l3.generate_report_from_kg()
+        if report_enrichment:
+            context_parts.append(f"[KG Report] Evidence chain from knowledge graph:\n{report_enrichment[:500]}")
+
+    # 7. Publish high-confidence evidence to shared board
+    for aid, agent in agents.items():
+        published = agent.memory.publish_to_shared_board(threshold=0.7)
+        board.publish_evidence(aid, published)
+
+        # Record agent action for ToM
+        agent.record_action(action.get("action_type", ""))
+
+    # 8. Overseer unified view
+    agent_kgs = {aid: agent.memory for aid, agent in agents.items()}
+    overseer.aggregate_knowledge_graphs(agent_kgs)
+
+    # Board summary
+    board_summary = board.get_board_summary()
+    if board_summary["total_evidence_items"] > 0:
+        context_parts.append(
+            f"[Shared Board] {board_summary['total_evidence_items']} evidence items | "
+            f"{board_summary['red_team_alerts']} red team alerts | "
+            f"{board_summary['handoffs']} handoffs"
+        )
+
+    return "\n".join(context_parts)
+
+
 def run_agent_on_task(
     client: OpenAI,
     task_id: str,
@@ -354,7 +533,22 @@ def run_agent_on_task(
 
     The agent communicates with the environment server via HTTP
     and uses the OpenAI client for LLM inference.
+
+    Multi-agent subsystems (Red Team, ToM, KG, Overseer) are
+    interleaved into each step when MULTI_AGENT_MODE is enabled.
     """
+    # Initialize multi-agent infrastructure
+    ma = {}
+    if MULTI_AGENT_ENABLED and MULTI_AGENT_MODE:
+        try:
+            ma = _init_multi_agent_for_task()
+            if verbose:
+                print(f"  Multi-agent: ON (Red Team: {ma['red_team'].strategy.get_name() if ma.get('red_team') and ma['red_team'].strategy else 'random'})")
+        except Exception as e:
+            if verbose:
+                print(f"  Multi-agent: OFF ({e})")
+            ma = {}
+
     # Reset environment
     reset_resp = requests.post(
         f"{ENV_BASE_URL}/env/reset",
@@ -590,6 +784,22 @@ def run_agent_on_task(
             f"{state_summary}\n"
         )
 
+        # Multi-agent context injection (Red Team, ToM, KG, Overseer)
+        if ma:
+            try:
+                ma_context = _multi_agent_step_context(
+                    ma, action, step_num, {
+                        **obs,
+                        "severity_set": severity_set,
+                        "log_sources_queried": list(log_sources_queried),
+                    }
+                )
+                if ma_context:
+                    feedback += f"\n--- MULTI-AGENT AWARENESS ---\n{ma_context}\n"
+            except Exception as e:
+                if verbose:
+                    print(f"  Multi-agent context error: {e}")
+
         if done:
             feedback += "EPISODE COMPLETE."
         elif steps_remaining <= 5 and not report_submitted:
@@ -614,13 +824,57 @@ def run_agent_on_task(
     final_score = grader_data.get("score", 0.0)
     log_end(success=done, steps=len(actions_taken), score=final_score, rewards=step_rewards)
 
-    return {
+    # Collect trajectory for EUREKA feedback loop
+    trajectory = {
+        "task_id": task_id,
+        "score": final_score,
+        "steps_used": len(actions_taken),
+        "max_steps": MAX_AGENT_STEPS,
+        "actions": actions_taken,
+        "evidence_found": evidence_collected,
+        "iocs_found": iocs_discovered,
+        "severity_set": severity_set,
+        "severity_correct": grader_data.get("breakdown", {}).get("severity_correct", False),
+        "category_set": True,  # If we classified, we set category
+        "category_correct": grader_data.get("breakdown", {}).get("category_correct", False),
+        "containment_executed": containment_done,
+        "report_submitted": report_submitted,
+    }
+
+    # Add KG stats if multi-agent is active
+    if ma and "agents" in ma:
+        l1 = ma["agents"].get("l1_triage")
+        if l1:
+            trajectory["kg_stats"] = l1.memory.get_graph_stats_for_eureka()
+
+    # Add Red Team reward to trajectory
+    if ma and "red_team" in ma:
+        trajectory["red_team_reward"] = ma["red_team"].get_reward_summary()
+
+    # Add Overseer violations
+    if ma and "overseer" in ma:
+        trajectory["overseer_violations"] = len(ma["overseer"].violations)
+
+    _trajectory_store.append(trajectory)
+    _grader_score_store.append(final_score)
+
+    result = {
         "task_id": task_id,
         "score": final_score,
         "steps_taken": len(actions_taken),
         "actions": actions_taken,
         "breakdown": grader_data.get("breakdown", {}),
     }
+
+    # Add multi-agent summary to result
+    if ma:
+        result["multi_agent"] = {
+            "red_team_summary": ma["red_team"].get_reward_summary() if ma.get("red_team") else {},
+            "overseer_summary": ma["overseer"].get_oversight_summary() if ma.get("overseer") else {},
+            "board_summary": ma["board"].get_board_summary() if ma.get("board") else {},
+        }
+
+    return result
 
 
 # =============================================================================
@@ -641,6 +895,7 @@ def main() -> None:
     print(f"Model: {MODEL_NAME}")
     print(f"Environment: {ENV_BASE_URL}")
     print(f"Tasks: {ALL_TASKS}")
+    print(f"Multi-Agent: {'ENABLED' if MULTI_AGENT_ENABLED and MULTI_AGENT_MODE else 'DISABLED'}")
     print("=" * 60)
 
     results = {}
@@ -661,6 +916,17 @@ def main() -> None:
         print(f"  Steps: {result['steps_taken']}")
         print(f"  Time: {elapsed:.1f}s")
 
+        # Print multi-agent summary if available
+        if "multi_agent" in result:
+            ma_summary = result["multi_agent"]
+            rt = ma_summary.get("red_team_summary", {})
+            ov = ma_summary.get("overseer_summary", {})
+            print(f"  Red Team: reward={rt.get('total_reward', 0):+.3f} "
+                  f"stealth={rt.get('stealth_ratio', 0):.0%} "
+                  f"ASR={rt.get('attack_success_rate', 0):.0%}")
+            print(f"  Overseer: {ov.get('violations_detected', 0)} violations, "
+                  f"{ov.get('safety_checks_denied', 0)} denied")
+
     # Summary
     mean_score = total_score / len(ALL_TASKS)
     total_elapsed = time.time() - start_all
@@ -673,15 +939,26 @@ def main() -> None:
     print(f"  Total time: {total_elapsed:.1f}s ({total_elapsed/60:.1f}min)")
     print("=" * 60)
 
+    # EUREKA trajectory summary
+    if _trajectory_store:
+        print(f"\nEUREKA Trajectories: {len(_trajectory_store)} episodes collected")
+        avg_kg_nodes = sum(
+            t.get('kg_stats', {}).get('evidence_count', 0)
+            for t in _trajectory_store
+        ) / len(_trajectory_store)
+        print(f"  Avg KG nodes: {avg_kg_nodes:.1f}")
+
     # Save results
     output = {
         "model": MODEL_NAME,
+        "multi_agent_enabled": MULTI_AGENT_ENABLED and MULTI_AGENT_MODE,
         "results": results,
         "aggregate": {
             "mean_score": round(mean_score, 4),
             "total_score": round(total_score, 4),
             "total_time_seconds": round(total_elapsed, 1),
         },
+        "eureka_trajectories": len(_trajectory_store),
     }
     with open("inference_results.json", "w") as f:
         json.dump(output, f, indent=2)

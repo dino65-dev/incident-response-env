@@ -36,7 +36,7 @@ Endpoints (hackathon extras):
 import os
 import sys
 import traceback
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -75,11 +75,40 @@ app = create_app(
 
 
 # =============================================================================
+# Multi-Agent & Adversarial Infrastructure
+# =============================================================================
+try:
+    from red_team.agent import RedTeamAgent, RedTeamAction, RedTeamActionType
+    from red_team.strategies import get_random_strategy
+    from multi_agent.agents import L1TriageAgent, L2SeniorAnalyst, L3IRLead, AgentRole
+    from multi_agent.overseer import OverseerAgent
+    from multi_agent.communication import SharedInvestigationBoard, CommunicationReward
+    from multi_agent.knowledge_graph import AgentMemoryGraph
+    from eureka.reward_designer import EurekaRewardDesigner
+    from eureka.trajectory_analyzer import TrajectoryAnalyzer
+    from training.ctde import CTDETrainer, JointObservation
+    from training.hmarl import SkillDiscovery, HierarchicalPolicy, DEFAULT_SOC_SKILLS
+    _MULTI_AGENT_AVAILABLE = True
+except ImportError:
+    _MULTI_AGENT_AVAILABLE = False
+
+# =============================================================================
 # Shared Stateful Environment for HTTP interaction
 # =============================================================================
 
 # This single instance persists state across /env/reset and /env/step calls
 _shared_env = IncidentResponseEnvEnvironment()
+
+# Multi-agent instances (initialized lazily)
+_red_team: Optional["RedTeamAgent"] = None
+_soc_agents: Dict[str, Any] = {}
+_overseer: Optional["OverseerAgent"] = None
+_shared_board: Optional["SharedInvestigationBoard"] = None
+_comm_reward: Optional["CommunicationReward"] = None
+_eureka: Optional["EurekaRewardDesigner"] = None
+_ctde_trainer: Optional["CTDETrainer"] = None
+_trajectory_store: List[Dict[str, Any]] = []
+_grader_score_store: List[float] = []
 
 
 class ResetBody(BaseModel):
@@ -200,6 +229,184 @@ async def evolution_stats():
     if not hasattr(_shared_env, '_evolution_engine') or _shared_env._evolution_engine is None:
         return JSONResponse(content={"status": "not_initialized", "message": "Reset with task_id='evolved' to activate"})
     return JSONResponse(content=_shared_env._evolution_engine.get_evolution_stats())
+
+
+# =============================================================================
+# Multi-Agent, Red Team & Research Endpoints
+# =============================================================================
+
+
+class RedTeamStepBody(BaseModel):
+    action_type: str
+    target: Optional[str] = None
+    payload: Optional[str] = None
+
+
+@app.post("/env/multi-agent/init")
+async def init_multi_agent():
+    """Initialize multi-agent infrastructure (L1/L2/L3 + Overseer + Red Team)."""
+    global _red_team, _soc_agents, _overseer, _shared_board, _comm_reward, _ctde_trainer
+    if not _MULTI_AGENT_AVAILABLE:
+        raise HTTPException(status_code=501, detail="Multi-agent modules not available")
+
+    _red_team = RedTeamAgent(strategy=get_random_strategy())
+    _soc_agents = {
+        "l1_triage": L1TriageAgent(),
+        "l2_senior": L2SeniorAnalyst(),
+        "l3_lead": L3IRLead(),
+    }
+    _overseer = OverseerAgent()
+    _shared_board = SharedInvestigationBoard()
+    _comm_reward = CommunicationReward(total_training_steps=1000)
+    _ctde_trainer = CTDETrainer()
+    _ctde_trainer.initialize_policies(["l1_triage", "l2_senior", "l3_lead"])
+
+    # Reset all agents
+    for agent in _soc_agents.values():
+        agent.reset(partner_ids=list(_soc_agents.keys()))
+    _overseer.reset()
+    _red_team.reset()
+    _shared_board.reset()
+
+    return JSONResponse(content={
+        "status": "initialized",
+        "agents": list(_soc_agents.keys()) + ["overseer", "red_team"],
+        "red_team_strategy": _red_team.strategy.get_name() if _red_team.strategy else "random",
+    })
+
+
+@app.post("/env/red-team-step")
+async def red_team_step(body: RedTeamStepBody):
+    """Execute a red team action and return result with visible reward."""
+    if _red_team is None:
+        raise HTTPException(status_code=400, detail="Red team not initialized. Call /env/multi-agent/init first.")
+
+    try:
+        action_type = RedTeamActionType(body.action_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid action: {body.action_type}. Valid: {[a.value for a in RedTeamActionType]}"
+        )
+
+    action = RedTeamAction(
+        action_type=action_type,
+        target=body.target,
+        payload=body.payload,
+    )
+
+    defender_state = {
+        "log_sources_queried": list(_shared_env._log_sources_queried),
+        "containment_score": _shared_env._grade_containment() if _shared_env._scenario else 0.0,
+        "severity_set": _shared_env._severity_set is not None,
+        "steps_remaining": (
+            _shared_env._scenario.max_steps - _shared_env._state.step_count
+            if _shared_env._scenario else 0
+        ),
+    }
+
+    scenario_evidence = list(_shared_env._scenario.critical_evidence) if _shared_env._scenario else []
+
+    result = _red_team.step(action, defender_state, scenario_evidence)
+
+    # Add red team alert to shared board if detected
+    if result["detected"] and _shared_board:
+        _shared_board.add_red_team_alert({
+            "action": body.action_type,
+            "detected": True,
+            "step": _shared_env._state.step_count,
+        })
+
+    return JSONResponse(content=result)
+
+
+@app.get("/env/knowledge-graph")
+async def get_knowledge_graph():
+    """Get the aggregated knowledge graph from all agents (for visualization)."""
+    if not _soc_agents or _overseer is None:
+        raise HTTPException(status_code=400, detail="Multi-agent not initialized.")
+
+    agent_kgs = {aid: agent.memory for aid, agent in _soc_agents.items()}
+    unified = _overseer.aggregate_knowledge_graphs(agent_kgs)
+    return JSONResponse(content=unified)
+
+
+@app.get("/env/overseer")
+async def get_overseer_status():
+    """Get Overseer agent oversight summary."""
+    if _overseer is None:
+        raise HTTPException(status_code=400, detail="Overseer not initialized.")
+    return JSONResponse(content=_overseer.get_oversight_summary())
+
+
+@app.get("/env/red-team-summary")
+async def get_red_team_summary():
+    """Get Red Team reward summary (visible to training loop)."""
+    if _red_team is None:
+        raise HTTPException(status_code=400, detail="Red team not initialized.")
+    return JSONResponse(content=_red_team.get_reward_summary())
+
+
+@app.get("/env/shared-board")
+async def get_shared_board():
+    """Get shared investigation board summary."""
+    if _shared_board is None:
+        raise HTTPException(status_code=400, detail="Shared board not initialized.")
+    return JSONResponse(content=_shared_board.get_board_summary())
+
+
+@app.post("/eureka/refine")
+async def eureka_refine():
+    """Run EUREKA reward refinement loop on stored trajectories."""
+    global _eureka
+    if not _MULTI_AGENT_AVAILABLE:
+        raise HTTPException(status_code=501, detail="EUREKA modules not available")
+
+    if not _trajectory_store:
+        raise HTTPException(status_code=400, detail="No trajectories stored. Run episodes first.")
+
+    if _eureka is None:
+        _eureka = EurekaRewardDesigner()
+        _eureka.set_context(
+            env_source_code="Incident Response SOC Environment with multi-agent team",
+            task_description="Investigate cybersecurity alerts, classify threats, contain them, and report",
+        )
+
+    kg_stats = None
+    if _soc_agents:
+        kg_stats = list(_soc_agents.values())[0].memory.get_graph_stats_for_eureka()
+
+    red_stats = _red_team.get_reward_summary() if _red_team else None
+    overseer_v = [
+        {"severity": v.severity, "agent_id": v.agent_id, "description": v.description}
+        for v in (_overseer.violations if _overseer else [])
+    ]
+
+    best = _eureka.run_refinement_loop(
+        trajectories=_trajectory_store,
+        grader_scores=_grader_score_store,
+        n_iterations=3,
+        kg_stats=kg_stats,
+        red_team_stats=red_stats,
+        overseer_violations=overseer_v,
+    )
+
+    return JSONResponse(content={
+        "best_reward": {
+            "id": best.candidate_id if best else None,
+            "score": round(best.score, 4) if best else 0,
+            "description": best.description if best else "",
+        },
+        "history": _eureka.get_refinement_history(),
+    })
+
+
+@app.get("/env/training-stats")
+async def get_training_stats():
+    """Get CTDE training statistics."""
+    if _ctde_trainer is None:
+        raise HTTPException(status_code=400, detail="CTDE trainer not initialized.")
+    return JSONResponse(content=_ctde_trainer.get_training_summary())
 
 
 def main(host: str = "0.0.0.0", port: int = 8000):

@@ -1,69 +1,51 @@
-# Copyright (c) 2026 - OpenEnv Hackathon Submission
-# Incident Response Triage Environment
+# =============================================================================
+# Dockerfile for HF Spaces — GRPO SOC Training + Live Dashboard
+#
+# Runs on GPU Space (T4/A10G). Installs unsloth, trl, project modules.
+# Launches Gradio dashboard that can trigger training and show live graphs.
+#
+# HF Spaces config in README.md:
+#   sdk: docker
+#   app_port: 7860
+# =============================================================================
 
-ARG BASE_IMAGE=ghcr.io/meta-pytorch/openenv-base:latest
-FROM ${BASE_IMAGE} AS builder
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
-WORKDIR /app
-
-# Ensure git is available
+# System deps
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git && \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends \
+        gcc g++ git curl \
+        fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
 
-ARG BUILD_MODE=in-repo
-ARG ENV_NAME=incident_response_env
+# Create non-root user (HF Spaces requirement)
+RUN useradd -m -u 1000 user
+USER user
+ENV HOME=/home/user \
+    PATH=/home/user/.local/bin:$PATH \
+    PYTHONUNBUFFERED=1
 
-# Copy environment code
-COPY . /app/env
+WORKDIR /home/user/app
 
-WORKDIR /app/env
+# Install training stack
+RUN pip install --no-cache-dir --user \
+    unsloth vllm \
+    "trl==0.22.2" \
+    "transformers==4.56.2" \
+    "datasets>=2.18.0" \
+    "accelerate>=0.30.0" \
+    "peft>=0.12.0" \
+    "bitsandbytes>=0.44.0" \
+    "gradio>=5.0.0" \
+    "matplotlib>=3.8.0" \
+    "numpy>=1.24.0"
 
-# Ensure uv is available
-RUN if ! command -v uv >/dev/null 2>&1; then \
-        curl -LsSf https://astral.sh/uv/install.sh | sh && \
-        mv /root/.local/bin/uv /usr/local/bin/uv && \
-        mv /root/.local/bin/uvx /usr/local/bin/uvx; \
-    fi
+# Copy entire project (modules, tasks, training, etc.)
+COPY --chown=user:user . .
 
-# Install dependencies
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f uv.lock ]; then \
-        uv sync --frozen --no-install-project --no-editable; \
-    else \
-        uv sync --no-install-project --no-editable; \
-    fi
+EXPOSE 7860
 
-RUN --mount=type=cache,target=/root/.cache/uv \
-    if [ -f uv.lock ]; then \
-        uv sync --frozen --no-editable; \
-    else \
-        uv sync --no-editable; \
-    fi
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:7860/')" || exit 1
 
-# Final runtime stage
-FROM ${BASE_IMAGE}
-
-WORKDIR /app
-
-# Copy the virtual environment from builder
-COPY --from=builder /app/env/.venv /app/.venv
-
-# Copy the environment code
-COPY --from=builder /app/env /app/env
-
-# Set PATH to use the virtual environment
-ENV PATH="/app/.venv/bin:$PATH"
-
-# Set PYTHONPATH
-ENV PYTHONPATH="/app/env:$PYTHONPATH"
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# Expose port
-EXPOSE 8000
-
-# Run the FastAPI server
-CMD ["sh", "-c", "cd /app/env && uvicorn server.app:app --host 0.0.0.0 --port 8000"]
+CMD ["python", "gradio_dashboard.py"]

@@ -206,6 +206,67 @@ class IncidentState(State):
     investigation_complete: bool = Field(default=False)
 
 
+# =============================================================================
+# Multi-Agent & Adversarial Models
+# =============================================================================
+
+
+class AgentRole(str, Enum):
+    """Roles in the SOC team hierarchy + adversarial."""
+    L1_TRIAGE = "l1_triage"
+    L2_SENIOR = "l2_senior"
+    L3_LEAD = "l3_lead"
+    OVERSEER = "overseer"
+    RED_TEAM = "red_team"
+
+
+class RedTeamActionType(str, Enum):
+    """Actions available to the Red Team adversarial agent."""
+    INJECT_FALSE_LOG = "inject_false_log"
+    COVER_TRACKS = "cover_tracks"
+    LATERAL_MOVE_SILENTLY = "lateral_move_silently"
+    DEPLOY_DECOY_IOC = "deploy_decoy_ioc"
+    ACCELERATE_ATTACK = "accelerate_attack"
+    EXFILTRATE_DATA = "exfiltrate_data"
+    WAIT = "wait"
+
+
+class MultiAgentObservation(Observation):
+    """
+    Observation from a multi-agent step, including per-agent views,
+    red team state, and overseer alerts.
+    """
+    # Per-agent observations
+    agent_observations: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Observations keyed by agent_id"
+    )
+
+    # Red team state (visible reward signal)
+    red_team_state: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Red team state including reward signal"
+    )
+
+    # Overseer alerts
+    overseer_alerts: List[str] = Field(
+        default_factory=list,
+        description="Policy violation alerts from the Overseer agent"
+    )
+
+    # Shared board summary
+    shared_board: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Shared investigation board summary"
+    )
+
+    # Knowledge graph stats (feeds into EUREKA)
+    kg_stats: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Aggregated knowledge graph statistics"
+    )
+
+
 __all__ = [
     "Severity",
     "ActionType",
@@ -214,4 +275,7 @@ __all__ = [
     "IncidentAction",
     "IncidentObservation",
     "IncidentState",
+    "AgentRole",
+    "RedTeamActionType",
+    "MultiAgentObservation",
 ]
