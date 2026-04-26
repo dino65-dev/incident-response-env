@@ -243,6 +243,8 @@ def _train_loop(model_name, max_steps, lr, num_gen):
             W = {"fmt": 0.11, "evi": 0.19, "sev": 0.14, "cnt": 0.17,
                  "eff": 0.10, "cat": 0.09, "ldv": 0.05}
             composites = []
+            ctde_b_list = []
+            skill_b_list = []
             for i in range(len(completions)):
                 text = completions[i][0]["content"] if isinstance(completions[i], list) else completions[i]
                 base = (W["fmt"]*rf[i] + W["evi"]*re_[i] + W["sev"]*rs[i] +
@@ -265,11 +267,13 @@ def _train_loop(model_name, max_steps, lr, num_gen):
                     skill_b = min(skill_b, 0.07)
                 trunc = -0.5 if '</summary>' not in text and '</think>' not in text else 0.0
                 total = base + ctde_b + skill_b + trunc
+                ctde_b_list.append(ctde_b)
+                skill_b_list.append(skill_b)
                 composites.append(total)
             n = len(completions)
             for key, vals in [("format", rf), ("evidence", re_), ("severity", rs),
                               ("containment", rc), ("efficiency", eff), ("category", rcat),
-                              ("len_div", rld), ("ctde_bonus", [0]*n), ("skill_bonus", [0]*n), ("total", composites)]:
+                              ("len_div", rld), ("ctde_bonus", ctde_b_list), ("skill_bonus", skill_b_list), ("total", composites)]:
                 reward_log[key].append(sum(vals) / n)
             reward_log["step"].append(len(reward_log["step"]))
             # Write live
