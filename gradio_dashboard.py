@@ -314,8 +314,8 @@ def use_demo():
     return "\u2705 Loaded 150-step demo data"
 
 
-def handle_start(model_name, max_steps, lr, num_gen):
-    return train_runner.start_training(model_name, max_steps, lr, num_gen)
+def handle_start(max_steps, lr, num_gen):
+    return train_runner.start_training("Qwen/Qwen2.5-3B-Instruct", max_steps, lr, num_gen)
 
 
 def handle_stop():
@@ -482,12 +482,6 @@ def create_app():
         with gr.Tabs():
             with gr.TabItem("\U0001f680 Training"):
                 with gr.Row():
-                    with gr.Column(scale=2):
-                        model_input = gr.Textbox(
-                            value="unsloth/Qwen3-4B",
-                            label="Model Name (HuggingFace)",
-                            interactive=False,
-                        )
                     with gr.Column(scale=1):
                         steps_input = gr.Number(value=100, label="Max Steps", precision=0)
                     with gr.Column(scale=1):
@@ -498,7 +492,7 @@ def create_app():
                     start_btn = gr.Button("\U0001f680 Start Training", variant="primary", size="lg")
                     stop_btn = gr.Button("\u23f9\ufe0f Stop Training", variant="stop", size="lg")
                 train_status = gr.Textbox(
-                    value="\u23f8\ufe0f  Idle \u2014 configure and start training",
+                    value="\u23f8\ufe0f  Idle \u2014 configure and start training (Model: Qwen/Qwen2.5-3B-Instruct)",
                     label="Training Status", interactive=False, max_lines=2,
                 )
                 gr.Markdown("*Graphs below auto-refresh every 5 seconds during training.*")
@@ -542,7 +536,7 @@ def create_app():
         # Training controls
         start_btn.click(
             fn=handle_start,
-            inputs=[model_input, steps_input, lr_input, gen_input],
+            inputs=[steps_input, lr_input, gen_input],
             outputs=[train_status],
         )
         stop_btn.click(fn=handle_stop, outputs=[train_status])
