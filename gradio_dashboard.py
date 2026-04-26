@@ -486,6 +486,7 @@ def create_app():
                         model_input = gr.Textbox(
                             value="unsloth/Qwen3-4B",
                             label="Model Name (HuggingFace)",
+                            interactive=False,
                         )
                     with gr.Column(scale=1):
                         steps_input = gr.Number(value=100, label="Max Steps", precision=0)
