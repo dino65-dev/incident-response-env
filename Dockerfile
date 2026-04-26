@@ -38,7 +38,8 @@ RUN pip install --no-cache-dir --user \
     "bitsandbytes>=0.44.0" \
     "gradio>=5.0.0" \
     "matplotlib>=3.8.0" \
-    "numpy>=1.24.0"
+    "numpy>=1.24.0" \
+    "openenv-core"
 
 # Copy entire project (modules, tasks, training, etc.)
 COPY --chown=user:user . .
