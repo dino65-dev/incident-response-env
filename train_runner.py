@@ -109,7 +109,7 @@ def _train_loop(model_name, max_steps, lr, num_gen):
         task_ids = list(SCENARIOS.keys())
         for tid in task_ids:
             scenario = SCENARIOS[tid]
-            alert = f"ALERT: {scenario.description}\n\nLOGS:\n"
+            alert = f"ALERT: {scenario.alert_summary}\n\nLOGS:\n"
             for entry in scenario.log_entries[:8]:
                 alert += f"[{entry.source}] {entry.content}\n"
             prompts.append({
@@ -125,8 +125,8 @@ def _train_loop(model_name, max_steps, lr, num_gen):
         GROUND_TRUTH = {}
         for tid, sc in SCENARIOS.items():
             GROUND_TRUTH[tid] = {
-                "severity": sc.severity if hasattr(sc, "severity") else "",
-                "category": sc.category if hasattr(sc, "category") else "",
+                "severity": sc.true_severity.value if hasattr(sc, "true_severity") and sc.true_severity else "",
+                "category": sc.true_category.value if hasattr(sc, "true_category") and sc.true_category else "",
                 "critical_iocs": list(sc.critical_iocs) if hasattr(sc, "critical_iocs") else [],
             }
 
